@@ -1,0 +1,14 @@
+.DS_Store
+.idea/
+.gradle/
+*.iml
+local.properties
+
+web/node_modules/
+web/dist/
+web/coverage/
+
+android/.gradle/
+android/build/
+android/app/build/
+android/app/src/main/assets/

@@ -1,0 +1,1047 @@
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+
+import { AiClient } from '../ai/ai-client'
+import type { AiDifficulty, AiSearchResult } from '../ai/types'
+import ChessBoard from '../components/ChessBoard.vue'
+import { loadExperienceSettings, saveExperienceSettings } from '../experience/settings'
+import { SoundController } from '../experience/sound-controller'
+import { INITIAL_BOARD } from '../game/board'
+import { GameController, type MoveRecord } from '../game/game-controller'
+import type { Square } from '../game/types'
+import { InputController } from '../input/input-controller'
+
+declare global {
+  interface Window {
+    __xiangqiHandleBack?: () => boolean
+  }
+}
+
+const gameController = new GameController(INITIAL_BOARD)
+const aiClient = new AiClient()
+const gameMode = ref<'local' | 'ai'>('local')
+const aiDifficulty = ref<AiDifficulty>('normal')
+const aiThinking = ref(false)
+const lastAiResult = ref<AiSearchResult | null>(null)
+const experienceSettings = ref(loadExperienceSettings())
+const experienceOpen = ref(false)
+const experienceFocusIndex = ref(0)
+const soundController = new SoundController(experienceSettings.value.soundEnabled)
+let aiGeneration = 0
+
+const inputController = new InputController({
+  selectSquare: (row, col) => {
+    const snapshot = gameController.getSnapshot()
+    if (gameMode.value === 'ai' && (snapshot.currentPlayer === 'black' || aiThinking.value)) {
+      return
+    }
+    gameController.selectSquare(row, col)
+  },
+  cancelSelection: () => gameController.cancelSelection(),
+  undoMove: () => undoMatch(),
+  restartGame: () => restartMatch(),
+  toggleGameMode: () => toggleGameMode(),
+  cycleAiDifficulty: () => cycleAiDifficulty(),
+  openExperience: () => openExperiencePanel(),
+})
+
+const gameState = ref(gameController.getSnapshot())
+const inputState = ref(inputController.getSnapshot())
+const hoveredSquare = ref<Square | null>(null)
+const recentMoveRecords = computed<ReadonlyArray<MoveRecord>>(() => (
+  gameState.value.moveRecords.slice(-16)
+))
+const inputModeLabel = computed(() => (inputState.value.mode === 'mouse' ? '鼠标' : '遥控器'))
+const gameModeLabel = computed(() => (gameMode.value === 'local' ? '本地双人' : '人机对战'))
+const difficultyLabel = computed(() => {
+  if (aiDifficulty.value === 'easy') {
+    return '简单 · 深度 2'
+  }
+  if (aiDifficulty.value === 'hard') {
+    return '困难 · 深度 4'
+  }
+  return '普通 · 深度 3'
+})
+const aiSearchSummary = computed(() => {
+  if (aiThinking.value) {
+    return '测量中'
+  }
+  if (!lastAiResult.value) {
+    return '等待首回合'
+  }
+  return `D${lastAiResult.value.depth} · ${lastAiResult.value.elapsedMs}ms`
+})
+const aiNodeSummary = computed(() => (
+  lastAiResult.value ? lastAiResult.value.nodes.toLocaleString('zh-CN') : '—'
+))
+const currentPlayerLabel = computed(() => (gameState.value.currentPlayer === 'red' ? '红方' : '黑方'))
+const winnerLabel = computed(() => (gameState.value.status.winner === 'red' ? '红方' : '黑方'))
+const gameStatusLabel = computed(() => {
+  if (aiThinking.value) {
+    return 'AI 思考中'
+  }
+  switch (gameState.value.status.phase) {
+    case 'check':
+      return '将军'
+    case 'checkmate':
+      return '将死'
+    case 'stalemate':
+      return '困毙'
+    default:
+      return '对局中'
+  }
+})
+const statusCaption = computed(() => {
+  if (aiThinking.value) {
+    return 'AI 后台计算'
+  }
+  if (gameState.value.status.phase === 'checkmate') {
+    return '将死 · 胜方'
+  }
+  if (gameState.value.status.phase === 'stalemate') {
+    return '困毙 · 胜方'
+  }
+  if (gameState.value.status.phase === 'check') {
+    return '当前被将军'
+  }
+  return '当前回合'
+})
+const statusHeadline = computed(() => (
+  aiThinking.value
+    ? '黑方思考中'
+    : gameState.value.status.winner ? `${winnerLabel.value}胜` : currentPlayerLabel.value
+))
+const statusPlayer = computed(() => gameState.value.status.winner ?? gameState.value.currentPlayer)
+const checkedGeneralSquare = computed<Square | null>(() => {
+  const checkedPlayer = gameState.value.status.checkedPlayer
+  if (!checkedPlayer) {
+    return null
+  }
+
+  const general = gameState.value.board.find(
+    (piece) => piece.player === checkedPlayer && piece.type === 'general',
+  )
+  return general ? { row: general.row, col: general.col } : null
+})
+
+function syncState(): void {
+  const nextGameState = gameController.getSnapshot()
+  const currentGameState = gameState.value
+  const selectionChanged =
+    nextGameState.selectedSquare?.row !== currentGameState.selectedSquare?.row
+    || nextGameState.selectedSquare?.col !== currentGameState.selectedSquare?.col
+
+  if (
+    nextGameState.board !== currentGameState.board
+    || nextGameState.currentPlayer !== currentGameState.currentPlayer
+    || selectionChanged
+    || nextGameState.legalMoves !== currentGameState.legalMoves
+    || nextGameState.lastMove !== currentGameState.lastMove
+    || nextGameState.history.length !== currentGameState.history.length
+    || nextGameState.status !== currentGameState.status
+  ) {
+    if (nextGameState.history.length > currentGameState.history.length) {
+      if (nextGameState.status.winner) {
+        soundController.play('victory')
+      } else if (nextGameState.status.phase === 'check') {
+        soundController.play('check')
+      } else if (nextGameState.lastMove?.capturedPiece) {
+        soundController.play('capture')
+      } else {
+        soundController.play('move')
+      }
+    } else if (selectionChanged && nextGameState.selectedSquare) {
+      soundController.play('select')
+    }
+    gameState.value = nextGameState
+  }
+  inputState.value = inputController.getSnapshot()
+}
+
+function cancelAiSearch(): void {
+  aiGeneration += 1
+  aiThinking.value = false
+  aiClient.cancelPending()
+}
+
+function undoMatch(): boolean {
+  cancelAiSearch()
+  const snapshot = gameController.getSnapshot()
+  const undoTwice = gameMode.value === 'ai'
+    && snapshot.currentPlayer === 'red'
+    && snapshot.history.length >= 2
+
+  const changed = gameController.undoMove()
+  if (changed && undoTwice) {
+    gameController.undoMove()
+  }
+  lastAiResult.value = null
+  return changed
+}
+
+function restartMatch(): void {
+  cancelAiSearch()
+  gameController.restartGame()
+  lastAiResult.value = null
+}
+
+function toggleGameMode(): void {
+  cancelAiSearch()
+  gameMode.value = gameMode.value === 'local' ? 'ai' : 'local'
+  gameController.restartGame()
+  lastAiResult.value = null
+}
+
+function cycleAiDifficulty(): void {
+  cancelAiSearch()
+  const order: ReadonlyArray<AiDifficulty> = ['easy', 'normal', 'hard']
+  const currentIndex = order.indexOf(aiDifficulty.value)
+  aiDifficulty.value = order[(currentIndex + 1) % order.length] ?? 'normal'
+}
+
+function openExperiencePanel(): void {
+  gameController.cancelSelection()
+  experienceFocusIndex.value = 0
+  experienceOpen.value = true
+}
+
+function closeExperiencePanel(): void {
+  experienceOpen.value = false
+}
+
+function updateExperienceSettings(soundEnabled: boolean, motionEnabled: boolean): void {
+  experienceSettings.value = { soundEnabled, motionEnabled }
+  soundController.setEnabled(soundEnabled)
+  saveExperienceSettings(experienceSettings.value)
+}
+
+function toggleSound(): void {
+  const enabled = !experienceSettings.value.soundEnabled
+  updateExperienceSettings(enabled, experienceSettings.value.motionEnabled)
+  if (enabled) {
+    soundController.play('select')
+  }
+}
+
+function toggleMotion(): void {
+  updateExperienceSettings(
+    experienceSettings.value.soundEnabled,
+    !experienceSettings.value.motionEnabled,
+  )
+  soundController.play('select')
+}
+
+function activateExperienceControl(): void {
+  if (experienceFocusIndex.value === 0) {
+    toggleSound()
+  } else if (experienceFocusIndex.value === 1) {
+    toggleMotion()
+  } else {
+    closeExperiencePanel()
+  }
+}
+
+async function requestAiMoveIfNeeded(): Promise<void> {
+  const snapshot = gameController.getSnapshot()
+  if (
+    gameMode.value !== 'ai'
+    || snapshot.currentPlayer !== 'black'
+    || snapshot.status.winner
+    || aiThinking.value
+  ) {
+    return
+  }
+
+  const generation = aiGeneration + 1
+  aiGeneration = generation
+  aiThinking.value = true
+
+  try {
+    const result = await aiClient.findMove(snapshot.board, 'black', aiDifficulty.value)
+    if (generation !== aiGeneration || gameMode.value !== 'ai') {
+      return
+    }
+
+    lastAiResult.value = result
+    if (result.move) {
+      gameController.playMove(result.move)
+    }
+  } catch {
+    // Cancellation is expected when the player undoes, restarts, or changes mode.
+  } finally {
+    if (generation === aiGeneration) {
+      aiThinking.value = false
+      syncState()
+    }
+  }
+}
+
+function finishInteraction(): void {
+  syncState()
+  void requestAiMoveIfNeeded()
+}
+
+function handlePointerActivity(): void {
+  if (inputController.activateMouse()) {
+    syncState()
+  }
+}
+
+function handleSquareClick(square: Square): void {
+  inputController.selectFromPointer(square)
+  hoveredSquare.value = square
+  finishInteraction()
+}
+
+function handleHoverChange(square: Square | null): void {
+  hoveredSquare.value = square
+}
+
+function handleCancelFromPointer(): void {
+  inputController.cancelFromPointer()
+  finishInteraction()
+}
+
+function handleUndo(): void {
+  inputController.undoFromPointer()
+  hoveredSquare.value = null
+  finishInteraction()
+}
+
+function handleRestart(): void {
+  inputController.restartFromPointer()
+  hoveredSquare.value = null
+  finishInteraction()
+}
+
+function handleToggleMode(): void {
+  inputController.toggleModeFromPointer()
+  hoveredSquare.value = null
+  finishInteraction()
+}
+
+function handleCycleDifficulty(): void {
+  inputController.cycleDifficultyFromPointer()
+  hoveredSquare.value = null
+  finishInteraction()
+}
+
+function handleOpenExperience(): void {
+  inputController.openExperienceFromPointer()
+  hoveredSquare.value = null
+  finishInteraction()
+}
+
+function handleKeyDown(event: KeyboardEvent): void {
+  if (experienceOpen.value) {
+    let handled = true
+    if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') {
+      experienceFocusIndex.value = Math.max(0, experienceFocusIndex.value - 1)
+    } else if (event.key === 'ArrowDown' || event.key === 'ArrowRight') {
+      experienceFocusIndex.value = Math.min(2, experienceFocusIndex.value + 1)
+    } else if (event.key === 'Enter') {
+      activateExperienceControl()
+    } else if (event.key === 'Escape' || event.key === 'Backspace') {
+      closeExperiencePanel()
+    } else {
+      handled = false
+    }
+
+    if (handled) {
+      event.preventDefault()
+      hoveredSquare.value = null
+      inputController.activateRemote()
+      syncState()
+    }
+    return
+  }
+
+  if (!inputController.handleRemoteKey(event.key)) {
+    return
+  }
+
+  event.preventDefault()
+  hoveredSquare.value = null
+  finishInteraction()
+}
+
+function handleVisibilityChange(): void {
+  if (document.hidden) {
+    cancelAiSearch()
+    return
+  }
+
+  void requestAiMoveIfNeeded()
+}
+
+onMounted(() => {
+  window.addEventListener('keydown', handleKeyDown)
+  document.addEventListener('visibilitychange', handleVisibilityChange)
+  window.__xiangqiHandleBack = () => {
+    if (experienceOpen.value) {
+      closeExperiencePanel()
+      return true
+    }
+    const handled = inputController.handleAndroidBack()
+    if (handled) {
+      syncState()
+    }
+    return handled
+  }
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', handleKeyDown)
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
+  delete window.__xiangqiHandleBack
+  aiClient.dispose()
+  soundController.dispose()
+})
+</script>
+
+<template>
+  <main
+    class="game-view"
+    :class="`game-view--${inputState.mode}`"
+    @pointermove="handlePointerActivity"
+    @pointerdown="handlePointerActivity"
+  >
+    <div class="game-content">
+      <ChessBoard
+        :input-mode="inputState.mode"
+        :cursor="inputState.cursor"
+        :hovered-square="hoveredSquare"
+        :selected-square="gameState.selectedSquare"
+        :board="gameState.board"
+        :legal-moves="gameState.legalMoves"
+        :last-move="gameState.lastMove"
+        :checked-square="checkedGeneralSquare"
+        :remote-focus-active="inputState.area === 'board'"
+        :motion-enabled="experienceSettings.motionEnabled"
+        @square-click="handleSquareClick"
+        @hover-change="handleHoverChange"
+        @cancel-selection="handleCancelFromPointer"
+      />
+
+      <div class="side-column">
+        <header class="game-header">
+          <p>XIANGQI TV</p>
+          <h1>中国象棋</h1>
+        </header>
+
+        <aside class="status-panel" aria-label="棋局信息">
+          <p class="phase-label">{{ gameMode === 'local' ? '本地对局' : '人机对局 · 玩家执红' }}</p>
+          <section
+            class="turn-card"
+            :class="{
+              'turn-card--alert': gameState.status.phase === 'check',
+              'turn-card--finished': Boolean(gameState.status.winner),
+            }"
+          >
+            <span
+              class="player-marker"
+              :class="`player-marker--${statusPlayer}`"
+              aria-hidden="true"
+            ></span>
+            <div>
+              <small>{{ statusCaption }}</small>
+              <strong>{{ statusHeadline }}</strong>
+            </div>
+          </section>
+
+          <dl>
+            <div>
+              <dt>游戏模式</dt>
+              <dd>{{ gameModeLabel }}</dd>
+            </div>
+            <div>
+              <dt>AI 难度</dt>
+              <dd>{{ gameMode === 'ai' ? difficultyLabel : '—' }}</dd>
+            </div>
+            <div v-if="gameMode === 'ai'">
+              <dt>AI 最近搜索</dt>
+              <dd>{{ aiSearchSummary }}</dd>
+            </div>
+            <div v-if="gameMode === 'ai'">
+              <dt>搜索节点</dt>
+              <dd>{{ aiNodeSummary }}</dd>
+            </div>
+            <div>
+              <dt>游戏状态</dt>
+              <dd>{{ gameStatusLabel }}</dd>
+            </div>
+            <div>
+              <dt>操作方式</dt>
+              <dd>{{ inputModeLabel }}</dd>
+            </div>
+            <div>
+              <dt>对局手数</dt>
+              <dd>{{ gameState.history.length }}</dd>
+            </div>
+          </dl>
+
+          <p class="hint">最右列再按 → 进入操作区 · 方向键选择 · ← 或 BACK 返回</p>
+        </aside>
+
+        <nav class="game-actions" aria-label="对局操作">
+          <button
+            class="action-button"
+            :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 0 }"
+            type="button"
+            :disabled="gameState.history.length === 0"
+            data-action-index="0"
+            @click="handleUndo"
+          >
+            <strong>悔棋</strong>
+            <small>撤回上一手</small>
+          </button>
+          <button
+            class="action-button"
+            :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 1 }"
+            type="button"
+            data-action-index="1"
+            @click="handleRestart"
+          >
+            <strong>重新开始</strong>
+            <small>恢复初始棋局</small>
+          </button>
+          <button
+            class="action-button"
+            :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 2 }"
+            type="button"
+            data-action-index="2"
+            @click="handleToggleMode"
+          >
+            <strong>对战模式</strong>
+            <small>{{ gameModeLabel }}</small>
+          </button>
+          <button
+            class="action-button"
+            :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 3 }"
+            type="button"
+            data-action-index="3"
+            @click="handleCycleDifficulty"
+          >
+            <strong>AI 难度</strong>
+            <small>{{ difficultyLabel }}</small>
+          </button>
+          <button
+            class="action-button action-button--wide"
+            :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 4 }"
+            type="button"
+            data-action-index="4"
+            @click="handleOpenExperience"
+          >
+            <strong>设置与棋谱</strong>
+            <small>{{ experienceSettings.soundEnabled ? '音效开' : '音效关' }} · {{ gameState.moveRecords.length }} 手</small>
+          </button>
+        </nav>
+      </div>
+    </div>
+
+    <div
+      v-if="experienceOpen"
+      class="experience-overlay"
+      role="presentation"
+      @click.self="closeExperiencePanel"
+    >
+      <section class="experience-dialog" role="dialog" aria-modal="true" aria-label="设置与棋谱">
+        <div class="experience-settings">
+          <p class="dialog-eyebrow">EXPERIENCE</p>
+          <h2>设置</h2>
+          <button
+            class="setting-control"
+            :class="{ 'setting-control--focused': inputState.mode === 'remote' && experienceFocusIndex === 0 }"
+            type="button"
+            @click="toggleSound"
+          >
+            <span>落子音效</span>
+            <strong>{{ experienceSettings.soundEnabled ? '开启' : '关闭' }}</strong>
+          </button>
+          <button
+            class="setting-control"
+            :class="{ 'setting-control--focused': inputState.mode === 'remote' && experienceFocusIndex === 1 }"
+            type="button"
+            @click="toggleMotion"
+          >
+            <span>走子动画</span>
+            <strong>{{ experienceSettings.motionEnabled ? '开启' : '关闭' }}</strong>
+          </button>
+          <button
+            class="setting-control setting-control--close"
+            :class="{ 'setting-control--focused': inputState.mode === 'remote' && experienceFocusIndex === 2 }"
+            type="button"
+            @click="closeExperiencePanel"
+          >
+            <span>返回对局</span>
+            <strong>关闭</strong>
+          </button>
+          <p class="dialog-hint">方向键切换 · OK 修改 · BACK 返回</p>
+        </div>
+
+        <div class="move-record-panel">
+          <div class="record-heading">
+            <div>
+              <p class="dialog-eyebrow">MOVE RECORD</p>
+              <h2>简明棋谱</h2>
+            </div>
+            <span>共 {{ gameState.moveRecords.length }} 手</span>
+          </div>
+          <ol v-if="recentMoveRecords.length" class="move-record-list">
+            <li
+              v-for="record in recentMoveRecords"
+              :key="record.ply"
+              :class="`move-record--${record.player}`"
+            >
+              <span>{{ record.ply }}</span>
+              <strong>{{ record.notation }}</strong>
+              <small>{{ record.player === 'red' ? '红' : '黑' }}</small>
+            </li>
+          </ol>
+          <p v-else class="empty-record">尚未落子，棋谱会在第一手后自动记录。</p>
+          <p v-if="gameState.moveRecords.length > 16" class="record-caption">显示最近 16 手</p>
+        </div>
+      </section>
+    </div>
+  </main>
+</template>
+
+<style scoped>
+.game-view {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  padding: 2.5vh 3vw;
+  background:
+    radial-gradient(circle at 26% 44%, rgba(129, 72, 34, 0.26), transparent 35%),
+    linear-gradient(135deg, #24170f, #0f0c09 70%);
+}
+
+.game-view--remote {
+  cursor: none;
+}
+
+.game-header {
+  width: 100%;
+  margin-bottom: 1.8vh;
+  text-align: left;
+}
+
+.game-header p {
+  margin: 0 0 0.8vh;
+  color: #af8652;
+  font-family: system-ui, sans-serif;
+  font-size: 1vw;
+  letter-spacing: 0.42em;
+}
+
+.game-header h1 {
+  margin: 0;
+  color: #f9e7bd;
+  font-size: 3.2vw;
+  letter-spacing: 0.18em;
+}
+
+.game-content {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+}
+
+.side-column {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  width: 20vw;
+  max-width: 360px;
+  margin-left: 4vw;
+}
+
+.status-panel {
+  width: 100%;
+  padding: 1.8vh 2vw;
+  border-left: 2px solid rgba(205, 155, 88, 0.45);
+  background: rgba(40, 26, 17, 0.55);
+}
+
+.phase-label {
+  margin: 0 0 1.6vh;
+  color: #b7986d;
+  font-size: 1.2vw;
+  letter-spacing: 0.3em;
+}
+
+.turn-card {
+  display: flex;
+  align-items: center;
+  padding: 1.6vh 1.4vw;
+  border: 1px solid rgba(224, 177, 103, 0.5);
+  background: rgba(85, 42, 24, 0.46);
+}
+
+.turn-card--alert {
+  border-color: rgba(255, 87, 75, 0.82);
+  background: rgba(104, 29, 23, 0.48);
+}
+
+.turn-card--finished {
+  border-color: rgba(238, 189, 75, 0.9);
+  background: rgba(99, 68, 20, 0.48);
+  box-shadow: 0 0 18px rgba(224, 166, 52, 0.18);
+}
+
+.player-marker {
+  width: 3vw;
+  height: 3vw;
+  margin-right: 1.4vw;
+  border: 3px solid currentColor;
+  border-radius: 50%;
+  background: #d7ad68;
+  box-shadow: inset 0 0 0 4px rgba(118, 41, 31, 0.18);
+}
+
+.player-marker--red {
+  color: #b44b3d;
+}
+
+.player-marker--black {
+  color: #29251f;
+}
+
+.turn-card small,
+.turn-card strong {
+  display: block;
+}
+
+.turn-card small {
+  color: #bca98d;
+  font-family: system-ui, sans-serif;
+  font-size: 1vw;
+}
+
+.turn-card strong {
+  margin-top: 0.4vh;
+  color: #f0d29a;
+  font-size: 2vw;
+  letter-spacing: 0.16em;
+}
+
+dl {
+  margin: 1.25vh 0;
+}
+
+dl div {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.72vh 0;
+  border-bottom: 1px solid rgba(196, 154, 98, 0.2);
+}
+
+dt,
+dd {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  font-size: 1.15vw;
+}
+
+dt {
+  color: #a99579;
+}
+
+dd {
+  color: #e5ca99;
+}
+
+.hint {
+  margin: 0;
+  color: #8f7b65;
+  font-family: system-ui, sans-serif;
+  font-size: 0.95vw;
+  line-height: 1.6;
+}
+
+.game-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1vh;
+  width: 100%;
+  margin-top: 1.4vh;
+}
+
+.action-button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35vh;
+  width: 100%;
+  min-height: 6.2vh;
+  padding: 0.8vh 0.6vw;
+  border: 2px solid rgba(201, 157, 94, 0.42);
+  outline: none;
+  background: rgba(58, 37, 23, 0.86);
+  color: #edd4a4;
+  cursor: pointer;
+}
+
+.action-button strong,
+.action-button small {
+  font-family: system-ui, sans-serif;
+}
+
+.action-button strong {
+  font-size: 1.05vw;
+  letter-spacing: 0.12em;
+}
+
+.action-button small {
+  color: #a99579;
+  font-size: 0.8vw;
+  white-space: nowrap;
+}
+
+.action-button:hover:not(:disabled) {
+  border-color: rgba(255, 231, 171, 0.8);
+  background: rgba(87, 54, 31, 0.94);
+}
+
+.action-button--focused {
+  border-color: #ffd65a;
+  background: rgba(101, 72, 27, 0.94);
+  box-shadow:
+    0 0 0 2px rgba(69, 43, 7, 0.92),
+    0 0 16px rgba(255, 213, 77, 0.72);
+}
+
+.action-button:disabled {
+  cursor: default;
+  opacity: 0.42;
+}
+
+.action-button--wide {
+  grid-column: 1 / -1;
+  min-height: 4.8vh;
+  flex-direction: row;
+}
+
+.action-button--wide small {
+  margin-left: 0.8vw;
+}
+
+.experience-overlay {
+  position: fixed;
+  z-index: 100;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 7, 5, 0.78);
+}
+
+.experience-dialog {
+  display: grid;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+  width: 64vw;
+  max-width: 1120px;
+  min-height: 58vh;
+  overflow: hidden;
+  border: 3px solid #8a5c30;
+  background: #21150e;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+}
+
+.experience-settings,
+.move-record-panel {
+  padding: 4vh 3vw;
+}
+
+.experience-settings {
+  border-right: 1px solid rgba(205, 155, 88, 0.35);
+  background: rgba(77, 43, 24, 0.25);
+}
+
+.dialog-eyebrow {
+  margin: 0 0 0.6vh;
+  color: #af8652;
+  font-family: system-ui, sans-serif;
+  font-size: 0.9vw;
+  letter-spacing: 0.34em;
+}
+
+.experience-dialog h2 {
+  margin: 0 0 2.5vh;
+  color: #f5deb0;
+  font-size: 2.5vw;
+  letter-spacing: 0.15em;
+}
+
+.setting-control {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: 6.5vh;
+  margin-bottom: 1.2vh;
+  padding: 0 1.4vw;
+  border: 2px solid rgba(201, 157, 94, 0.42);
+  outline: none;
+  background: rgba(53, 33, 21, 0.9);
+  color: #d8bd8d;
+  font-family: system-ui, sans-serif;
+  font-size: 1.25vw;
+  cursor: pointer;
+}
+
+.setting-control strong {
+  color: #f3d292;
+}
+
+.setting-control--close {
+  margin-top: 2vh;
+}
+
+.setting-control:hover,
+.setting-control--focused {
+  border-color: #ffd65a;
+  background: rgba(101, 72, 27, 0.94);
+  box-shadow: 0 0 10px rgba(255, 213, 77, 0.45);
+}
+
+.dialog-hint,
+.record-caption,
+.empty-record {
+  color: #9c876c;
+  font-family: system-ui, sans-serif;
+  font-size: 0.95vw;
+  line-height: 1.6;
+}
+
+.dialog-hint {
+  margin: 2vh 0 0;
+}
+
+.record-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.record-heading > span {
+  color: #b89a6e;
+  font-family: system-ui, sans-serif;
+  font-size: 1vw;
+}
+
+.move-record-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.8vh 1vw;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.move-record-list li {
+  display: grid;
+  grid-template-columns: 2vw minmax(0, 1fr) 1.8vw;
+  align-items: center;
+  min-height: 4.4vh;
+  padding: 0 0.8vw;
+  border-left: 3px solid #3b3328;
+  background: rgba(240, 210, 153, 0.055);
+}
+
+.move-record-list li > span,
+.move-record-list li > small {
+  color: #8f7b65;
+  font-family: system-ui, sans-serif;
+  font-size: 0.85vw;
+}
+
+.move-record-list li > strong {
+  color: #e8d0a2;
+  font-size: 1.1vw;
+  letter-spacing: 0.08em;
+}
+
+.move-record-list .move-record--red {
+  border-left-color: #b44b3d;
+}
+
+.move-record-list .move-record--black {
+  border-left-color: #8a8172;
+}
+
+.record-caption {
+  margin: 1.2vh 0 0;
+  text-align: right;
+}
+
+.empty-record {
+  margin-top: 7vh;
+  text-align: center;
+}
+
+@media (min-width: 1921px) {
+  .game-header p,
+  .turn-card small {
+    font-size: 20px;
+  }
+
+  .game-header h1 {
+    font-size: 64px;
+  }
+
+  .phase-label,
+  dt,
+  dd {
+    font-size: 23px;
+  }
+
+  .turn-card strong {
+    font-size: 40px;
+  }
+
+  .hint {
+    font-size: 19px;
+  }
+
+  .action-button strong {
+    font-size: 21px;
+  }
+
+  .action-button small {
+    font-size: 16px;
+  }
+
+  .dialog-eyebrow,
+  .move-record-list li > span,
+  .move-record-list li > small {
+    font-size: 17px;
+  }
+
+  .experience-dialog h2 {
+    font-size: 48px;
+  }
+
+  .setting-control {
+    font-size: 24px;
+  }
+
+  .dialog-hint,
+  .record-caption,
+  .empty-record,
+  .record-heading > span {
+    font-size: 19px;
+  }
+
+  .move-record-list li > strong {
+    font-size: 22px;
+  }
+}
+</style>
