@@ -78,6 +78,23 @@ describe('complete xiangqi legality', () => {
     })
   })
 
+  it('detects horse, cannon and crossed-river soldier attacks without false positives', () => {
+    const redGeneral = piece('red', 'general', 9, 4)
+    const blackGeneral = piece('black', 'general', 0, 3)
+    const horse = piece('black', 'horse', 7, 3)
+    const horseBoard = [redGeneral, blackGeneral, horse]
+    expect(isInCheck(horseBoard, 'red')).toBe(true)
+    expect(isInCheck([...horseBoard, piece('red', 'advisor', 8, 3)], 'red')).toBe(false)
+
+    const cannon = piece('black', 'cannon', 4, 4)
+    const screen = piece('red', 'soldier', 7, 4)
+    expect(isInCheck([redGeneral, blackGeneral, cannon, screen], 'red')).toBe(true)
+    expect(isInCheck([redGeneral, blackGeneral, cannon], 'red')).toBe(false)
+
+    const crossedSoldier = piece('black', 'soldier', 9, 3)
+    expect(isInCheck([redGeneral, blackGeneral, crossedSoldier], 'red')).toBe(true)
+  })
+
   it('recognizes checkmate as a win for the attacking side', () => {
     const board: BoardState = [
       piece('black', 'general', 0, 4),

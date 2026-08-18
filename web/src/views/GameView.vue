@@ -55,12 +55,15 @@ const inputModeLabel = computed(() => (inputState.value.mode === 'mouse' ? '鼠�
 const gameModeLabel = computed(() => (gameMode.value === 'local' ? '本地双人' : '人机对战'))
 const difficultyLabel = computed(() => {
   if (aiDifficulty.value === 'easy') {
-    return '简单 · 深度 2'
+    return '简单 · 0.35秒'
   }
   if (aiDifficulty.value === 'hard') {
-    return '困难 · 深度 4'
+    return '困难 · 3.2秒'
   }
-  return '普通 · 深度 3'
+  if (aiDifficulty.value === 'master') {
+    return '大师 · 7秒'
+  }
+  return '普通 · 1.1秒'
 })
 const aiSearchSummary = computed(() => {
   if (aiThinking.value) {
@@ -194,7 +197,7 @@ function toggleGameMode(): void {
 
 function cycleAiDifficulty(): void {
   cancelAiSearch()
-  const order: ReadonlyArray<AiDifficulty> = ['easy', 'normal', 'hard']
+  const order: ReadonlyArray<AiDifficulty> = ['easy', 'normal', 'hard', 'master']
   const currentIndex = order.indexOf(aiDifficulty.value)
   aiDifficulty.value = order[(currentIndex + 1) % order.length] ?? 'normal'
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { evaluateBoard, findBestMove } from './ai-engine'
+import { AI_DIFFICULTY_OPTIONS, evaluateBoard, findBestMove } from './ai-engine'
 import { INITIAL_BOARD } from '../game/board'
 import type { BoardState } from '../game/types'
 
@@ -52,4 +52,35 @@ describe('AiEngine', () => {
     expect(result.depth).toBe(0)
     expect(result.nodes).toBe(1)
   })
+
+  it('adds a separate master profile without weakening the existing levels', () => {
+    expect(AI_DIFFICULTY_OPTIONS.master.maxDepth).toBeGreaterThan(
+      AI_DIFFICULTY_OPTIONS.hard.maxDepth,
+    )
+    expect(AI_DIFFICULTY_OPTIONS.master.timeLimitMs).toBeGreaterThan(
+      AI_DIFFICULTY_OPTIONS.hard.timeLimitMs,
+    )
+    expect(AI_DIFFICULTY_OPTIONS.hard.maxDepth).toBeGreaterThanOrEqual(4)
+  })
+
+  it('uses quiescence search to avoid a poisoned capture at the horizon', () => {
+    const board: BoardState = [
+      { id: 'red-general', type: 'general', player: 'red', row: 9, col: 4 },
+      { id: 'black-general', type: 'general', player: 'black', row: 0, col: 3 },
+      { id: 'general-screen', type: 'soldier', player: 'red', row: 6, col: 4 },
+      { id: 'black-rook', type: 'rook', player: 'black', row: 5, col: 0 },
+      { id: 'red-cannon', type: 'cannon', player: 'red', row: 5, col: 2 },
+      { id: 'red-rook', type: 'rook', player: 'red', row: 5, col: 5 },
+    ]
+
+    const result = findBestMove(board, 'black', {
+      maxDepth: 1,
+      timeLimitMs: 2_000,
+      quiescenceDepth: 4,
+    })
+
+    expect(result.move?.to).not.toEqual({ row: 5, col: 2 })
+    expect(result.quiescenceNodes).toBeGreaterThan(0)
+  })
+
 })

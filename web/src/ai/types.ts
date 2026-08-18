@@ -1,10 +1,11 @@
 import type { BoardState, Move, Player } from '../game/types'
 
-export type AiDifficulty = 'easy' | 'normal' | 'hard'
+export type AiDifficulty = 'easy' | 'normal' | 'hard' | 'master'
 
 export interface AiSearchOptions {
   readonly maxDepth: number
   readonly timeLimitMs: number
+  readonly quiescenceDepth?: number
 }
 
 export interface AiSearchResult {
@@ -12,6 +13,9 @@ export interface AiSearchResult {
   readonly score: number
   readonly depth: number
   readonly nodes: number
+  readonly quiescenceNodes: number
+  readonly transpositionHits: number
+  readonly cutoffs: number
   readonly elapsedMs: number
 }
 

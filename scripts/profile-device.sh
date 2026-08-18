@@ -92,7 +92,7 @@ adb shell input keyevent 23
 adb shell input keyevent 19
 adb shell input keyevent 23
 
-# Four one-second samples cover the hard difficulty's 2.8-second budget.
+# Four one-second samples cover the hard difficulty's 3.2-second budget.
 adb shell top -b -d 1 -n 4 -p "$APP_PID"
 
 section "Post-AI memory"

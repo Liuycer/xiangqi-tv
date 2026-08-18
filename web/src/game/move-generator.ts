@@ -43,6 +43,8 @@ const ADVISOR_DIRECTIONS: ReadonlyArray<Direction> = [
   { row: 1, col: 1 },
 ]
 
+const boardLookupCache = new WeakMap<BoardState, ReadonlyArray<PieceState | null>>()
+
 function isInsideBoard(row: number, col: number): boolean {
   return row >= 0 && row < BOARD_ROWS && col >= 0 && col < BOARD_COLS
 }
@@ -64,7 +66,21 @@ function staysOnOwnSide(player: Player, row: number): boolean {
 }
 
 export function getPieceAt(board: BoardState, row: number, col: number): PieceState | null {
-  return board.find((piece) => piece.row === row && piece.col === col) ?? null
+  if (!isInsideBoard(row, col)) {
+    return null
+  }
+
+  let lookup = boardLookupCache.get(board)
+  if (!lookup) {
+    const nextLookup: Array<PieceState | null> = Array(BOARD_ROWS * BOARD_COLS).fill(null)
+    for (const piece of board) {
+      nextLookup[piece.row * BOARD_COLS + piece.col] = piece
+    }
+    lookup = nextLookup
+    boardLookupCache.set(board, lookup)
+  }
+
+  return lookup[row * BOARD_COLS + col] ?? null
 }
 
 function createMove(
@@ -252,4 +268,3 @@ export function getPseudoLegalMoves(
       return getSoldierMoves(board, piece)
   }
 }
-
