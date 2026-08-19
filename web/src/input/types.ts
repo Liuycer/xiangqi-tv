@@ -17,5 +17,6 @@ export interface InputActions {
   restartGame(): void
   toggleGameMode(): void
   cycleAiDifficulty(): void
+  openCustomDepthPicker(): void
   openExperience(): void
 }

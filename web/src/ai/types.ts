@@ -1,6 +1,6 @@
 import type { BoardState, Move, Player } from '../game/types'
 
-export type AiDifficulty = 'easy' | 'normal' | 'hard' | 'master'
+export type AiDifficulty = 'easy' | 'normal' | 'hard' | 'custom'
 
 export interface AiSearchOptions {
   readonly maxDepth: number

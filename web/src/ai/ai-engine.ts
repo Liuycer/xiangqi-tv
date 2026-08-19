@@ -25,10 +25,26 @@ const PIECE_VALUES: Readonly<Record<PieceState['type'], number>> = {
 }
 
 export const AI_DIFFICULTY_OPTIONS: Readonly<Record<AiDifficulty, AiSearchOptions>> = {
-  easy: { maxDepth: 2, timeLimitMs: 350, quiescenceDepth: 0 },
+  easy: { maxDepth: 2, timeLimitMs: 350, quiescenceDepth: 1 },
   normal: { maxDepth: 3, timeLimitMs: 1_100, quiescenceDepth: 1 },
   hard: { maxDepth: 5, timeLimitMs: 3_200, quiescenceDepth: 2 },
-  master: { maxDepth: 7, timeLimitMs: 7_000, quiescenceDepth: 2 },
+  custom: { maxDepth: 5, timeLimitMs: 3_200, quiescenceDepth: 2 },
+}
+
+export function getLocalFallbackDifficulty(
+  requestedDepth: number,
+): Exclude<AiDifficulty, 'custom'> {
+  if (requestedDepth <= AI_DIFFICULTY_OPTIONS.easy.maxDepth) {
+    return 'easy'
+  }
+  if (requestedDepth <= AI_DIFFICULTY_OPTIONS.normal.maxDepth) {
+    return 'normal'
+  }
+  return 'hard'
+}
+
+export function shouldUseCloudAi(difficulty: AiDifficulty): boolean {
+  return difficulty !== 'easy'
 }
 
 type TranspositionBound = 'exact' | 'lower' | 'upper'

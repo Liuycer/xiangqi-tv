@@ -11,6 +11,7 @@ function createActions(): InputActions {
     restartGame: vi.fn(),
     toggleGameMode: vi.fn(),
     cycleAiDifficulty: vi.fn(),
+    openCustomDepthPicker: vi.fn(),
     openExperience: vi.fn(),
   }
 }
@@ -91,6 +92,10 @@ describe('InputController', () => {
     controller.handleRemoteKey('ArrowRight')
     controller.handleRemoteKey('Enter')
     expect(actions.cycleAiDifficulty).toHaveBeenCalledTimes(1)
+
+    controller.handleRemoteKey('ArrowRight')
+    controller.handleRemoteKey('Enter')
+    expect(actions.openCustomDepthPicker).toHaveBeenCalledTimes(1)
 
     controller.handleRemoteKey('ArrowRight')
     controller.handleRemoteKey('Enter')

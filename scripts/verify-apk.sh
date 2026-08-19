@@ -43,6 +43,8 @@ printf '%s\n' "$APK_ENTRIES" | rg -q '^assets/index\.html$'
 printf '%s\n' "$APK_ENTRIES" | rg -q '^assets/assets/index-.*\.js$'
 printf '%s\n' "$APK_ENTRIES" | rg -q '^assets/assets/index-.*\.css$'
 printf '%s\n' "$APK_ENTRIES" | rg -q '^assets/assets/ai\.worker-.*\.js$'
+printf '%s\n' "$APK_ENTRIES" | rg -q '^res/raw/xiangqi_server_ca\.pem$'
+printf '%s\n' "$APK_ENTRIES" | rg -q '^res/xml/network_security_config\.xml$'
 
 if printf '%s\n' "$APK_ENTRIES" | rg -q '^lib/'; then
     echo "Unexpected native libraries found; armeabi-v7a compatibility must be reviewed." >&2
@@ -50,9 +52,10 @@ if printf '%s\n' "$APK_ENTRIES" | rg -q '^lib/'; then
 fi
 
 APK_PERMISSIONS=$("$APK_ANALYZER" manifest permissions "$APK_PATH" 2>/dev/null)
-if [ -n "$APK_PERMISSIONS" ]; then
+EXPECTED_PERMISSIONS=android.permission.INTERNET
+if [ "$APK_PERMISSIONS" != "$EXPECTED_PERMISSIONS" ]; then
     echo "Unexpected Android permissions:" >&2
-    echo "$APK_PERMISSIONS" >&2
+    printf '%s\n' "${APK_PERMISSIONS:-none}" >&2
     exit 1
 fi
 
@@ -65,5 +68,5 @@ echo "APK verification passed"
 echo "File: $APK_PATH"
 echo "Size: $APK_SIZE bytes"
 echo "SHA-256: $APK_SHA256"
-echo "Permissions: none"
-echo "Offline assets: HTML + JS + CSS + AI Worker"
+echo "Permissions: android.permission.INTERNET only"
+echo "Packaged assets: HTML + JS + CSS + local AI Worker + pinned server CA"

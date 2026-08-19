@@ -12,3 +12,7 @@ android/.gradle/
 android/build/
 android/app/build/
 android/app/src/main/assets/
+
+server/.venv/
+server/**/__pycache__/
+server/**/*.pyc
