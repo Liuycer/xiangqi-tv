@@ -170,3 +170,58 @@ describe('GameController local match controls', () => {
     expect(snapshot.status.phase).toBe('playing')
   })
 })
+
+describe('GameController repetition rules', () => {
+  function play(controller: GameController, from: [number, number], to: [number, number]): void {
+    controller.selectSquare(from[0], from[1])
+    controller.selectSquare(to[0], to[1])
+  }
+
+  it('ends the game with a loss when black repeats perpetual check', () => {
+    const board: BoardState = [
+      { id: 'red-general', type: 'general', player: 'red', row: 9, col: 4 },
+      { id: 'black-general', type: 'general', player: 'black', row: 0, col: 3 },
+      { id: 'black-rook', type: 'rook', player: 'black', row: 7, col: 4 },
+    ]
+    const controller = new GameController(board)
+
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      play(controller, [9, 4], [9, 5])
+      play(controller, [7, 4], [7, 5])
+      play(controller, [9, 5], [9, 4])
+      play(controller, [7, 5], [7, 4])
+    }
+
+    expect(controller.getSnapshot().status).toEqual({
+      phase: 'perpetual-check',
+      checkedPlayer: null,
+      winner: 'red',
+      offender: 'black',
+    })
+  })
+
+  it('declares a neutral threefold repetition a draw and undo restores play', () => {
+    const board: BoardState = [
+      { id: 'red-general', type: 'general', player: 'red', row: 9, col: 4 },
+      { id: 'black-general', type: 'general', player: 'black', row: 0, col: 3 },
+      { id: 'red-rook', type: 'rook', player: 'red', row: 8, col: 0 },
+      { id: 'black-rook', type: 'rook', player: 'black', row: 1, col: 8 },
+    ]
+    const controller = new GameController(board)
+
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      play(controller, [8, 0], [8, 1])
+      play(controller, [1, 8], [1, 7])
+      play(controller, [8, 1], [8, 0])
+      play(controller, [1, 7], [1, 8])
+    }
+
+    expect(controller.getSnapshot().status).toEqual({
+      phase: 'repetition-draw',
+      checkedPlayer: null,
+      winner: null,
+    })
+    expect(controller.undoMove()).toBe(true)
+    expect(controller.getSnapshot().status.phase).toBe('playing')
+  })
+})

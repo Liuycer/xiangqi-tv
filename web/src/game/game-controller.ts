@@ -1,6 +1,12 @@
 import { getPieceAt } from './move-generator'
 import { formatMoveNotation } from './notation'
-import { applyMove, getGameStatus, getLegalMoves, getOpponent } from './rule-engine'
+import {
+  adjudicateRepetition,
+  createInitialPositionEntry,
+  createPositionKey,
+  type PositionHistoryEntry,
+} from './repetition-adjudicator'
+import { applyMove, getGameStatus, getLegalMoves, getOpponent, isInCheck } from './rule-engine'
 import type { BoardState, GameStatus, Move, Player, Square } from './types'
 
 export interface MoveRecord {
@@ -34,11 +40,13 @@ export class GameController {
   private lastMove: Move | null = null
   private readonly history: Move[] = []
   private readonly moveRecords: MoveRecord[] = []
+  private readonly positionHistory: PositionHistoryEntry[]
   private status: GameStatus
 
   constructor(board: BoardState) {
     this.initialBoard = freezeBoard(board)
     this.board = this.initialBoard
+    this.positionHistory = [createInitialPositionEntry(this.board, this.currentPlayer)]
     this.status = getGameStatus(this.board, this.currentPlayer)
   }
 
@@ -56,7 +64,7 @@ export class GameController {
   }
 
   selectSquare(row: number, col: number): void {
-    if (this.status.winner) {
+    if (isFinished(this.status)) {
       return
     }
 
@@ -96,7 +104,7 @@ export class GameController {
   }
 
   playMove(move: Move): boolean {
-    if (this.status.winner) {
+    if (isFinished(this.status)) {
       return false
     }
 
@@ -137,13 +145,14 @@ export class GameController {
 
     this.board = freezeBoard(previousBoard)
     this.moveRecords.pop()
+    this.positionHistory.pop()
     this.currentPlayer = movingPiece.player
     this.selectedSquare = null
     this.legalMoves = []
     this.lastMove = this.history.length > 0
       ? this.history[this.history.length - 1] ?? null
       : null
-    this.status = getGameStatus(this.board, this.currentPlayer)
+    this.status = this.evaluateStatus()
     return true
   }
 
@@ -155,6 +164,8 @@ export class GameController {
     this.lastMove = null
     this.history.length = 0
     this.moveRecords.length = 0
+    this.positionHistory.length = 0
+    this.positionHistory.push(createInitialPositionEntry(this.board, this.currentPlayer))
     this.status = getGameStatus(this.board, this.currentPlayer)
   }
 
@@ -175,10 +186,46 @@ export class GameController {
       move,
     }))
     this.currentPlayer = getOpponent(this.currentPlayer)
-    this.status = getGameStatus(this.board, this.currentPlayer)
+    this.positionHistory.push(Object.freeze({
+      key: createPositionKey(this.board, this.currentPlayer),
+      sideToMove: this.currentPlayer,
+      move,
+      mover: movingPiece.player,
+      givesCheck: isInCheck(this.board, this.currentPlayer),
+    }))
+    this.status = this.evaluateStatus()
     this.selectedSquare = null
     this.legalMoves = []
   }
+
+  private evaluateStatus(): GameStatus {
+    const ordinaryStatus = getGameStatus(this.board, this.currentPlayer)
+    if (ordinaryStatus.winner) {
+      return ordinaryStatus
+    }
+
+    const repetition = adjudicateRepetition(this.positionHistory)
+    if (!repetition) {
+      return ordinaryStatus
+    }
+    if (repetition.type === 'perpetual-check') {
+      return {
+        phase: 'perpetual-check',
+        checkedPlayer: null,
+        winner: repetition.winner,
+        offender: repetition.offender,
+      }
+    }
+    return {
+      phase: 'repetition-draw',
+      checkedPlayer: null,
+      winner: null,
+    }
+  }
+}
+
+export function isFinished(status: GameStatus): boolean {
+  return status.winner !== null || status.phase === 'repetition-draw'
 }
 
 function freezeBoard(board: BoardState): BoardState {

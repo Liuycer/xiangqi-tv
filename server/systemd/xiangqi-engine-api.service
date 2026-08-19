@@ -1,0 +1,29 @@
+[Unit]
+Description=Xiangqi TV Pikafish API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xiangqi
+Group=xiangqi
+WorkingDirectory=/opt/xiangqi-api
+EnvironmentFile=/etc/xiangqi-engine-api.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/xiangqi-api/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=multi-user.target

@@ -2,12 +2,18 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 import { AiClient } from '../ai/ai-client'
+import {
+  AI_DIFFICULTY_OPTIONS,
+  getLocalFallbackDifficulty,
+  shouldUseCloudAi,
+} from '../ai/ai-engine'
+import { RemoteAiClient } from '../ai/remote-ai-client'
 import type { AiDifficulty, AiSearchResult } from '../ai/types'
 import ChessBoard from '../components/ChessBoard.vue'
 import { loadExperienceSettings, saveExperienceSettings } from '../experience/settings'
 import { SoundController } from '../experience/sound-controller'
 import { INITIAL_BOARD } from '../game/board'
-import { GameController, type MoveRecord } from '../game/game-controller'
+import { GameController, isFinished, type MoveRecord } from '../game/game-controller'
 import type { Square } from '../game/types'
 import { InputController } from '../input/input-controller'
 
@@ -19,10 +25,25 @@ declare global {
 
 const gameController = new GameController(INITIAL_BOARD)
 const aiClient = new AiClient()
-const gameMode = ref<'local' | 'ai'>('local')
+const remoteAiClient = new RemoteAiClient()
+const CUSTOM_DEPTH_MIN = 3
+const CUSTOM_DEPTH_MAX = 20
+const CUSTOM_DEPTH_DEFAULT = 5
+const DEPTH_GRID_COLUMNS = 6
+const customDepthOptions = Object.freeze(Array.from(
+  { length: CUSTOM_DEPTH_MAX - CUSTOM_DEPTH_MIN + 1 },
+  (_, index) => CUSTOM_DEPTH_MIN + index,
+))
+const gameMode = ref<'local' | 'ai'>('ai')
 const aiDifficulty = ref<AiDifficulty>('normal')
+const customDepth = ref(CUSTOM_DEPTH_DEFAULT)
 const aiThinking = ref(false)
+const aiError = ref<string | null>(null)
 const lastAiResult = ref<AiSearchResult | null>(null)
+const lastAiSource = ref<'local' | 'cloud' | null>(null)
+const lastAiFallback = ref(false)
+const depthPickerOpen = ref(false)
+const depthPickerFocusIndex = ref(CUSTOM_DEPTH_DEFAULT - CUSTOM_DEPTH_MIN)
 const experienceSettings = ref(loadExperienceSettings())
 const experienceOpen = ref(false)
 const experienceFocusIndex = ref(0)
@@ -42,6 +63,7 @@ const inputController = new InputController({
   restartGame: () => restartMatch(),
   toggleGameMode: () => toggleGameMode(),
   cycleAiDifficulty: () => cycleAiDifficulty(),
+  openCustomDepthPicker: () => openCustomDepthPicker(),
   openExperience: () => openExperiencePanel(),
 })
 
@@ -53,26 +75,34 @@ const recentMoveRecords = computed<ReadonlyArray<MoveRecord>>(() => (
 ))
 const inputModeLabel = computed(() => (inputState.value.mode === 'mouse' ? '鼠标' : '遥控器'))
 const gameModeLabel = computed(() => (gameMode.value === 'local' ? '本地双人' : '人机对战'))
+const targetAiDepth = computed(() => (
+  aiDifficulty.value === 'custom'
+    ? customDepth.value
+    : AI_DIFFICULTY_OPTIONS[aiDifficulty.value].maxDepth
+))
 const difficultyLabel = computed(() => {
   if (aiDifficulty.value === 'easy') {
-    return '简单 · 0.35秒'
+    return '简单 · D2'
   }
   if (aiDifficulty.value === 'hard') {
-    return '困难 · 3.2秒'
+    return '困难 · D5'
   }
-  if (aiDifficulty.value === 'master') {
-    return '大师 · 7秒'
+  if (aiDifficulty.value === 'custom') {
+    return `自定义 · D${customDepth.value}`
   }
-  return '普通 · 1.1秒'
+  return '普通 · D3'
 })
 const aiSearchSummary = computed(() => {
   if (aiThinking.value) {
     return '测量中'
   }
   if (!lastAiResult.value) {
-    return '等待首回合'
+    return aiError.value ?? '等待首回合'
   }
-  return `D${lastAiResult.value.depth} · ${lastAiResult.value.elapsedMs}ms`
+  const source = lastAiSource.value === 'cloud'
+    ? '云端'
+    : lastAiFallback.value ? '本地回退' : '本地'
+  return `${source} D${lastAiResult.value.depth} · ${lastAiResult.value.elapsedMs}ms`
 })
 const aiNodeSummary = computed(() => (
   lastAiResult.value ? lastAiResult.value.nodes.toLocaleString('zh-CN') : '—'
@@ -90,6 +120,10 @@ const gameStatusLabel = computed(() => {
       return '将死'
     case 'stalemate':
       return '困毙'
+    case 'perpetual-check':
+      return '长将判负'
+    case 'repetition-draw':
+      return '重复和棋'
     default:
       return '对局中'
   }
@@ -104,6 +138,12 @@ const statusCaption = computed(() => {
   if (gameState.value.status.phase === 'stalemate') {
     return '困毙 · 胜方'
   }
+  if (gameState.value.status.phase === 'perpetual-check') {
+    return `${gameState.value.status.offender === 'red' ? '红方' : '黑方'}长将`
+  }
+  if (gameState.value.status.phase === 'repetition-draw') {
+    return '三次重复局面'
+  }
   if (gameState.value.status.phase === 'check') {
     return '当前被将军'
   }
@@ -112,7 +152,9 @@ const statusCaption = computed(() => {
 const statusHeadline = computed(() => (
   aiThinking.value
     ? '黑方思考中'
-    : gameState.value.status.winner ? `${winnerLabel.value}胜` : currentPlayerLabel.value
+    : gameState.value.status.phase === 'repetition-draw'
+      ? '和棋'
+      : gameState.value.status.winner ? `${winnerLabel.value}胜` : currentPlayerLabel.value
 ))
 const statusPlayer = computed(() => gameState.value.status.winner ?? gameState.value.currentPlayer)
 const checkedGeneralSquare = computed<Square | null>(() => {
@@ -165,6 +207,14 @@ function cancelAiSearch(): void {
   aiGeneration += 1
   aiThinking.value = false
   aiClient.cancelPending()
+  remoteAiClient.cancelPending()
+}
+
+function resetAiResult(): void {
+  lastAiResult.value = null
+  lastAiSource.value = null
+  lastAiFallback.value = false
+  aiError.value = null
 }
 
 function undoMatch(): boolean {
@@ -178,28 +228,62 @@ function undoMatch(): boolean {
   if (changed && undoTwice) {
     gameController.undoMove()
   }
-  lastAiResult.value = null
+  resetAiResult()
   return changed
 }
 
 function restartMatch(): void {
   cancelAiSearch()
   gameController.restartGame()
-  lastAiResult.value = null
+  resetAiResult()
 }
 
 function toggleGameMode(): void {
   cancelAiSearch()
   gameMode.value = gameMode.value === 'local' ? 'ai' : 'local'
   gameController.restartGame()
-  lastAiResult.value = null
+  resetAiResult()
 }
 
 function cycleAiDifficulty(): void {
   cancelAiSearch()
-  const order: ReadonlyArray<AiDifficulty> = ['easy', 'normal', 'hard', 'master']
+  const order: ReadonlyArray<AiDifficulty> = ['easy', 'normal', 'hard', 'custom']
   const currentIndex = order.indexOf(aiDifficulty.value)
   aiDifficulty.value = order[(currentIndex + 1) % order.length] ?? 'normal'
+  resetAiResult()
+  if (aiDifficulty.value === 'custom') {
+    openCustomDepthPicker()
+  }
+}
+
+function openCustomDepthPicker(): void {
+  cancelAiSearch()
+  gameController.cancelSelection()
+  depthPickerFocusIndex.value = customDepth.value - CUSTOM_DEPTH_MIN
+  depthPickerOpen.value = true
+}
+
+function closeCustomDepthPicker(): void {
+  depthPickerOpen.value = false
+}
+
+function selectCustomDepth(depth: number): void {
+  if (depth < CUSTOM_DEPTH_MIN || depth > CUSTOM_DEPTH_MAX) {
+    return
+  }
+  cancelAiSearch()
+  aiDifficulty.value = 'custom'
+  customDepth.value = depth
+  depthPickerFocusIndex.value = depth - CUSTOM_DEPTH_MIN
+  closeCustomDepthPicker()
+  resetAiResult()
+}
+
+function moveDepthPickerFocus(offset: number): void {
+  depthPickerFocusIndex.value = Math.min(
+    Math.max(depthPickerFocusIndex.value + offset, 0),
+    customDepthOptions.length - 1,
+  )
 }
 
 function openExperiencePanel(): void {
@@ -249,7 +333,7 @@ async function requestAiMoveIfNeeded(): Promise<void> {
   if (
     gameMode.value !== 'ai'
     || snapshot.currentPlayer !== 'black'
-    || snapshot.status.winner
+    || isFinished(snapshot.status)
     || aiThinking.value
   ) {
     return
@@ -258,19 +342,56 @@ async function requestAiMoveIfNeeded(): Promise<void> {
   const generation = aiGeneration + 1
   aiGeneration = generation
   aiThinking.value = true
+  aiError.value = null
 
   try {
-    const result = await aiClient.findMove(snapshot.board, 'black', aiDifficulty.value)
+    let result: AiSearchResult
+    let source: 'local' | 'cloud' = 'local'
+    let usedFallback = false
+    if (!shouldUseCloudAi(aiDifficulty.value)) {
+      result = await aiClient.findMove(snapshot.board, 'black', 'easy')
+    } else if (remoteAiClient.isConfigured()) {
+      try {
+        result = await remoteAiClient.findMove({
+          initialBoard: INITIAL_BOARD,
+          board: snapshot.board,
+          player: 'black',
+          moves: snapshot.history,
+        }, targetAiDepth.value)
+        source = 'cloud'
+      } catch {
+        if (generation !== aiGeneration || gameMode.value !== 'ai') {
+          return
+        }
+        usedFallback = true
+        result = await aiClient.findMove(
+          snapshot.board,
+          'black',
+          getLocalFallbackDifficulty(targetAiDepth.value),
+        )
+      }
+    } else {
+      usedFallback = true
+      result = await aiClient.findMove(
+        snapshot.board,
+        'black',
+        getLocalFallbackDifficulty(targetAiDepth.value),
+      )
+    }
     if (generation !== aiGeneration || gameMode.value !== 'ai') {
       return
     }
 
     lastAiResult.value = result
+    lastAiSource.value = source
+    lastAiFallback.value = usedFallback
     if (result.move) {
       gameController.playMove(result.move)
     }
-  } catch {
-    // Cancellation is expected when the player undoes, restarts, or changes mode.
+  } catch (error) {
+    if (generation === aiGeneration && gameMode.value === 'ai') {
+      aiError.value = error instanceof Error ? error.message : 'AI 搜索失败'
+    }
   } finally {
     if (generation === aiGeneration) {
       aiThinking.value = false
@@ -329,6 +450,12 @@ function handleCycleDifficulty(): void {
   finishInteraction()
 }
 
+function handleOpenCustomDepthPicker(): void {
+  inputController.openCustomDepthPickerFromPointer()
+  hoveredSquare.value = null
+  finishInteraction()
+}
+
 function handleOpenExperience(): void {
   inputController.openExperienceFromPointer()
   hoveredSquare.value = null
@@ -336,6 +463,36 @@ function handleOpenExperience(): void {
 }
 
 function handleKeyDown(event: KeyboardEvent): void {
+  if (depthPickerOpen.value) {
+    let handled = true
+    if (event.key === 'ArrowLeft') {
+      moveDepthPickerFocus(-1)
+    } else if (event.key === 'ArrowRight') {
+      moveDepthPickerFocus(1)
+    } else if (event.key === 'ArrowUp') {
+      moveDepthPickerFocus(-DEPTH_GRID_COLUMNS)
+    } else if (event.key === 'ArrowDown') {
+      moveDepthPickerFocus(DEPTH_GRID_COLUMNS)
+    } else if (event.key === 'Enter') {
+      const depth = customDepthOptions[depthPickerFocusIndex.value]
+      if (depth !== undefined) {
+        selectCustomDepth(depth)
+      }
+    } else if (event.key === 'Escape' || event.key === 'Backspace') {
+      closeCustomDepthPicker()
+    } else {
+      handled = false
+    }
+
+    if (handled) {
+      event.preventDefault()
+      hoveredSquare.value = null
+      inputController.activateRemote()
+      syncState()
+    }
+    return
+  }
+
   if (experienceOpen.value) {
     let handled = true
     if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') {
@@ -381,6 +538,10 @@ onMounted(() => {
   window.addEventListener('keydown', handleKeyDown)
   document.addEventListener('visibilitychange', handleVisibilityChange)
   window.__xiangqiHandleBack = () => {
+    if (depthPickerOpen.value) {
+      closeCustomDepthPicker()
+      return true
+    }
     if (experienceOpen.value) {
       closeExperiencePanel()
       return true
@@ -398,6 +559,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('visibilitychange', handleVisibilityChange)
   delete window.__xiangqiHandleBack
   aiClient.dispose()
+  remoteAiClient.dispose()
   soundController.dispose()
 })
 </script>
@@ -438,7 +600,7 @@ onBeforeUnmount(() => {
             class="turn-card"
             :class="{
               'turn-card--alert': gameState.status.phase === 'check',
-              'turn-card--finished': Boolean(gameState.status.winner),
+              'turn-card--finished': isFinished(gameState.status),
             }"
           >
             <span
@@ -483,7 +645,7 @@ onBeforeUnmount(() => {
             </div>
           </dl>
 
-          <p class="hint">最右列再按 → 进入操作区 · 方向键选择 · ← 或 BACK 返回</p>
+          <p class="hint">最右列再按 → 进入操作区 · 自定义深度可一次选取 · ← 或 BACK 返回</p>
         </aside>
 
         <nav class="game-actions" aria-label="对局操作">
@@ -529,10 +691,22 @@ onBeforeUnmount(() => {
             <small>{{ difficultyLabel }}</small>
           </button>
           <button
-            class="action-button action-button--wide"
+            class="action-button"
             :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 4 }"
             type="button"
             data-action-index="4"
+            aria-haspopup="dialog"
+            :aria-expanded="depthPickerOpen"
+            @click="handleOpenCustomDepthPicker"
+          >
+            <strong>自定义深度</strong>
+            <small>D{{ customDepth }} · 打开选单</small>
+          </button>
+          <button
+            class="action-button"
+            :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 5 }"
+            type="button"
+            data-action-index="5"
             @click="handleOpenExperience"
           >
             <strong>设置与棋谱</strong>
@@ -540,6 +714,47 @@ onBeforeUnmount(() => {
           </button>
         </nav>
       </div>
+    </div>
+
+    <div
+      v-if="depthPickerOpen"
+      class="depth-picker-overlay"
+      role="presentation"
+      @click.self="closeCustomDepthPicker"
+    >
+      <section
+        class="depth-picker-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="选择自定义 AI 深度"
+      >
+        <header class="depth-picker-heading">
+          <div>
+            <p class="dialog-eyebrow">AI SEARCH DEPTH</p>
+            <h2>选择自定义深度</h2>
+          </div>
+          <span>D3–D20</span>
+        </header>
+        <div class="depth-picker-grid" role="listbox" aria-label="AI 搜索深度">
+          <button
+            v-for="(depth, index) in customDepthOptions"
+            :key="depth"
+            class="depth-option"
+            :class="{
+              'depth-option--selected': depth === customDepth,
+              'depth-option--focused': inputState.mode === 'remote' && index === depthPickerFocusIndex,
+            }"
+            type="button"
+            role="option"
+            :aria-selected="depth === customDepth"
+            @click="selectCustomDepth(depth)"
+          >
+            <strong>D{{ depth }}</strong>
+            <small v-if="depth === 5">默认</small>
+          </button>
+        </div>
+        <p class="depth-picker-hint">鼠标点击选择 · 方向键移动 · OK 确认 · BACK 取消</p>
+      </section>
     </div>
 
     <div
@@ -833,6 +1048,7 @@ dd {
   margin-left: 0.8vw;
 }
 
+.depth-picker-overlay,
 .experience-overlay {
   position: fixed;
   z-index: 100;
@@ -844,6 +1060,93 @@ dd {
   align-items: center;
   justify-content: center;
   background: rgba(10, 7, 5, 0.78);
+}
+
+.depth-picker-dialog {
+  box-sizing: border-box;
+  width: 58vw;
+  max-width: 980px;
+  max-height: 82vh;
+  padding: 3.2vh 3vw;
+  overflow: hidden;
+  border: 3px solid #8a5c30;
+  background: #21150e;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.68);
+}
+
+.depth-picker-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 2.2vh;
+}
+
+.depth-picker-heading h2 {
+  margin: 0;
+  color: #f5deb0;
+  font-size: 2.35vw;
+  letter-spacing: 0.12em;
+}
+
+.depth-picker-heading > span {
+  padding: 0.8vh 1vw;
+  border: 1px solid rgba(205, 155, 88, 0.45);
+  color: #d5b77f;
+  font-family: system-ui, sans-serif;
+  font-size: 1.05vw;
+}
+
+.depth-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 1.2vh 0.8vw;
+}
+
+.depth-option {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 8vh;
+  padding: 0.7vh 0.4vw;
+  border: 2px solid rgba(201, 157, 94, 0.38);
+  outline: none;
+  background: rgba(53, 33, 21, 0.92);
+  color: #e8ca92;
+  cursor: pointer;
+}
+
+.depth-option strong {
+  font-family: system-ui, sans-serif;
+  font-size: 1.55vw;
+}
+
+.depth-option small {
+  min-height: 1em;
+  margin-top: 0.25vh;
+  color: #aa8c60;
+  font-family: system-ui, sans-serif;
+  font-size: 0.75vw;
+}
+
+.depth-option--selected {
+  border-color: rgba(224, 177, 103, 0.88);
+  background: rgba(91, 54, 29, 0.94);
+}
+
+.depth-option:hover,
+.depth-option--focused {
+  border-color: #ffd65a;
+  background: rgba(113, 78, 29, 0.98);
+  box-shadow: 0 0 14px rgba(255, 213, 77, 0.55);
+}
+
+.depth-picker-hint {
+  margin: 2vh 0 0;
+  color: #9c876c;
+  font-family: system-ui, sans-serif;
+  font-size: 0.95vw;
+  text-align: center;
 }
 
 .experience-dialog {
@@ -1030,6 +1333,26 @@ dd {
 
   .experience-dialog h2 {
     font-size: 48px;
+  }
+
+  .depth-picker-heading h2 {
+    font-size: 44px;
+  }
+
+  .depth-picker-heading > span {
+    font-size: 20px;
+  }
+
+  .depth-option strong {
+    font-size: 30px;
+  }
+
+  .depth-option small {
+    font-size: 15px;
+  }
+
+  .depth-picker-hint {
+    font-size: 19px;
   }
 
   .setting-control {

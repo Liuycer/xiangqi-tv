@@ -29,10 +29,17 @@ export interface Move {
   readonly capturedPiece: PieceState | null
 }
 
-export type GamePhase = 'playing' | 'check' | 'checkmate' | 'stalemate'
+export type GamePhase =
+  | 'playing'
+  | 'check'
+  | 'checkmate'
+  | 'stalemate'
+  | 'perpetual-check'
+  | 'repetition-draw'
 
 export interface GameStatus {
   readonly phase: GamePhase
   readonly checkedPlayer: Player | null
   readonly winner: Player | null
+  readonly offender?: Player
 }

@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
-import { AI_DIFFICULTY_OPTIONS, evaluateBoard, findBestMove } from './ai-engine'
+import {
+  AI_DIFFICULTY_OPTIONS,
+  evaluateBoard,
+  findBestMove,
+  getLocalFallbackDifficulty,
+  shouldUseCloudAi,
+} from './ai-engine'
 import { INITIAL_BOARD } from '../game/board'
 import type { BoardState } from '../game/types'
 
@@ -53,14 +59,25 @@ describe('AiEngine', () => {
     expect(result.nodes).toBe(1)
   })
 
-  it('adds a separate master profile without weakening the existing levels', () => {
-    expect(AI_DIFFICULTY_OPTIONS.master.maxDepth).toBeGreaterThan(
-      AI_DIFFICULTY_OPTIONS.hard.maxDepth,
+  it('uses the four TV difficulty profiles and a safe local custom fallback', () => {
+    expect(AI_DIFFICULTY_OPTIONS.easy.maxDepth).toBe(2)
+    expect(AI_DIFFICULTY_OPTIONS.normal.maxDepth).toBe(3)
+    expect(AI_DIFFICULTY_OPTIONS.hard.maxDepth).toBe(5)
+    expect(AI_DIFFICULTY_OPTIONS.custom.maxDepth).toBe(5)
+    expect(AI_DIFFICULTY_OPTIONS.easy.timeLimitMs).toBeLessThan(
+      AI_DIFFICULTY_OPTIONS.normal.timeLimitMs,
     )
-    expect(AI_DIFFICULTY_OPTIONS.master.timeLimitMs).toBeGreaterThan(
+    expect(AI_DIFFICULTY_OPTIONS.normal.timeLimitMs).toBeLessThan(
       AI_DIFFICULTY_OPTIONS.hard.timeLimitMs,
     )
-    expect(AI_DIFFICULTY_OPTIONS.hard.maxDepth).toBeGreaterThanOrEqual(4)
+    expect(getLocalFallbackDifficulty(2)).toBe('easy')
+    expect(getLocalFallbackDifficulty(3)).toBe('normal')
+    expect(getLocalFallbackDifficulty(5)).toBe('hard')
+    expect(getLocalFallbackDifficulty(20)).toBe('hard')
+    expect(shouldUseCloudAi('easy')).toBe(false)
+    expect(shouldUseCloudAi('normal')).toBe(true)
+    expect(shouldUseCloudAi('hard')).toBe(true)
+    expect(shouldUseCloudAi('custom')).toBe(true)
   })
 
   it('uses quiescence search to avoid a poisoned capture at the horizon', () => {
