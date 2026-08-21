@@ -14,6 +14,7 @@ const props = defineProps<{
   board: BoardState
   legalMoves: ReadonlyArray<Move>
   lastMove: Move | null
+  analysisMove: Move | null
   checkedSquare: Square | null
   remoteFocusActive: boolean
   motionEnabled: boolean
@@ -44,6 +45,8 @@ const SQUARE_STATE = {
   lastFrom: 32,
   lastTo: 64,
   check: 128,
+  analysisFrom: 256,
+  analysisTo: 512,
 } as const
 
 const squareVisualStates = computed(() => boardSquares.map((square) => {
@@ -77,6 +80,12 @@ const squareVisualStates = computed(() => boardSquares.map((square) => {
   }
   if (isSameSquare(props.checkedSquare, square)) {
     state |= SQUARE_STATE.check
+  }
+  if (isSameSquare(props.analysisMove?.from ?? null, square)) {
+    state |= SQUARE_STATE.analysisFrom
+  }
+  if (isSameSquare(props.analysisMove?.to ?? null, square)) {
+    state |= SQUARE_STATE.analysisTo
   }
 
   return state
@@ -188,6 +197,16 @@ function getSquarePosition(square: Square): Readonly<Record<string, string>> {
           aria-hidden="true"
         ></span>
         <span v-if="hasSquareState(index, SQUARE_STATE.check)" class="check-marker" aria-hidden="true"></span>
+        <span
+          v-if="hasSquareState(index, SQUARE_STATE.analysisFrom)"
+          class="analysis-marker analysis-marker--from"
+          aria-hidden="true"
+        ></span>
+        <span
+          v-if="hasSquareState(index, SQUARE_STATE.analysisTo)"
+          class="analysis-marker analysis-marker--to"
+          aria-hidden="true"
+        ></span>
         <span v-if="hasSquareState(index, SQUARE_STATE.legal)" class="legal-marker" aria-hidden="true"></span>
       </div>
     </div>
@@ -343,7 +362,8 @@ function getSquarePosition(square: Square): Readonly<Record<string, string>> {
 }
 
 .history-marker,
-.check-marker {
+.check-marker,
+.analysis-marker {
   position: absolute;
   pointer-events: none;
 }
@@ -381,6 +401,30 @@ function getSquarePosition(square: Square): Readonly<Record<string, string>> {
     0 0 0 2px rgba(64, 5, 5, 0.9),
     0 0 11px rgba(255, 49, 42, 0.9),
     inset 0 0 7px rgba(255, 49, 42, 0.46);
+}
+
+.analysis-marker {
+  z-index: 2;
+  top: 3%;
+  right: 3%;
+  bottom: 3%;
+  left: 3%;
+  border-radius: 22%;
+}
+
+.analysis-marker--from {
+  border: 5px dashed #bc8cff;
+  background: rgba(120, 66, 184, 0.14);
+  box-shadow: 0 0 9px rgba(184, 128, 255, 0.72);
+}
+
+.analysis-marker--to {
+  border: 6px solid #a974f5;
+  background: rgba(124, 66, 190, 0.18);
+  box-shadow:
+    0 0 0 2px rgba(46, 20, 78, 0.85),
+    0 0 12px rgba(183, 126, 255, 0.88),
+    inset 0 0 8px rgba(196, 154, 255, 0.42);
 }
 
 @media (min-width: 1921px) {

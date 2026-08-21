@@ -7,8 +7,14 @@ import {
   getLocalFallbackDifficulty,
   shouldUseCloudAi,
 } from '../ai/ai-engine'
+import {
+  getAnalysisPreset,
+  type AnalysisPresetKey,
+} from '../ai/analysis-presentation'
 import { RemoteAiClient } from '../ai/remote-ai-client'
+import type { PositionAnalysisResult } from '../ai/analysis-types'
 import type { AiDifficulty, AiSearchResult } from '../ai/types'
+import AnalysisPanel from '../components/AnalysisPanel.vue'
 import ChessBoard from '../components/ChessBoard.vue'
 import { loadExperienceSettings, saveExperienceSettings } from '../experience/settings'
 import { SoundController } from '../experience/sound-controller'
@@ -47,8 +53,17 @@ const depthPickerFocusIndex = ref(CUSTOM_DEPTH_DEFAULT - CUSTOM_DEPTH_MIN)
 const experienceSettings = ref(loadExperienceSettings())
 const experienceOpen = ref(false)
 const experienceFocusIndex = ref(0)
+const analysisOpen = ref(false)
+const analysisThinking = ref(false)
+const analysisError = ref<string | null>(null)
+const analysisResult = ref<PositionAnalysisResult | null>(null)
+const analysisCandidateRank = ref<number | null>(null)
+const analysisPreviewRank = ref<number | null>(null)
+const analysisPreset = ref<AnalysisPresetKey>('standard')
+const analysisFocusIndex = ref(1)
 const soundController = new SoundController(experienceSettings.value.soundEnabled)
 let aiGeneration = 0
+let analysisGeneration = 0
 
 const inputController = new InputController({
   selectSquare: (row, col) => {
@@ -65,6 +80,7 @@ const inputController = new InputController({
   cycleAiDifficulty: () => cycleAiDifficulty(),
   openCustomDepthPicker: () => openCustomDepthPicker(),
   openExperience: () => openExperiencePanel(),
+  openAnalysis: () => openAnalysisPanel(),
 })
 
 const gameState = ref(gameController.getSnapshot())
@@ -75,6 +91,32 @@ const recentMoveRecords = computed<ReadonlyArray<MoveRecord>>(() => (
 ))
 const inputModeLabel = computed(() => (inputState.value.mode === 'mouse' ? '鼠标' : '遥控器'))
 const gameModeLabel = computed(() => (gameMode.value === 'local' ? '本地双人' : '人机对战'))
+const analysisConfigured = computed(() => remoteAiClient.isConfigured())
+const analysisVisibleCandidateRank = computed(() => {
+  if (analysisOpen.value) {
+    if (inputState.value.mode === 'remote' && analysisFocusIndex.value >= 5) {
+      return analysisFocusIndex.value - 4
+    }
+    if (analysisPreviewRank.value !== null) {
+      return analysisPreviewRank.value
+    }
+  }
+  return analysisCandidateRank.value
+})
+const analysisHighlightedMove = computed(() => (
+  analysisResult.value?.candidates.find(
+    (candidate) => candidate.rank === analysisVisibleCandidateRank.value,
+  )?.move ?? null
+))
+const analysisActionLabel = computed(() => {
+  const candidate = analysisResult.value?.candidates.find(
+    (item) => item.rank === analysisCandidateRank.value,
+  )
+  if (candidate) {
+    return `已高亮 · ${candidate.variation[0]?.notation ?? candidate.moveUci}`
+  }
+  return analysisConfigured.value ? 'Pikafish · 三路候选' : '云端服务未配置'
+})
 const targetAiDepth = computed(() => (
   aiDifficulty.value === 'custom'
     ? customDepth.value
@@ -172,12 +214,13 @@ const checkedGeneralSquare = computed<Square | null>(() => {
 function syncState(): void {
   const nextGameState = gameController.getSnapshot()
   const currentGameState = gameState.value
+  const boardChanged = nextGameState.board !== currentGameState.board
   const selectionChanged =
     nextGameState.selectedSquare?.row !== currentGameState.selectedSquare?.row
     || nextGameState.selectedSquare?.col !== currentGameState.selectedSquare?.col
 
   if (
-    nextGameState.board !== currentGameState.board
+    boardChanged
     || nextGameState.currentPlayer !== currentGameState.currentPlayer
     || selectionChanged
     || nextGameState.legalMoves !== currentGameState.legalMoves
@@ -185,6 +228,9 @@ function syncState(): void {
     || nextGameState.history.length !== currentGameState.history.length
     || nextGameState.status !== currentGameState.status
   ) {
+    if (boardChanged) {
+      cancelAnalysisRequest(true)
+    }
     if (nextGameState.history.length > currentGameState.history.length) {
       if (nextGameState.status.winner) {
         soundController.play('victory')
@@ -210,6 +256,18 @@ function cancelAiSearch(): void {
   remoteAiClient.cancelPending()
 }
 
+function cancelAnalysisRequest(clearResult = false): void {
+  analysisGeneration += 1
+  analysisThinking.value = false
+  analysisPreviewRank.value = null
+  remoteAiClient.cancelPending()
+  if (clearResult) {
+    analysisResult.value = null
+    analysisCandidateRank.value = null
+    analysisError.value = null
+  }
+}
+
 function resetAiResult(): void {
   lastAiResult.value = null
   lastAiSource.value = null
@@ -218,6 +276,7 @@ function resetAiResult(): void {
 }
 
 function undoMatch(): boolean {
+  cancelAnalysisRequest(true)
   cancelAiSearch()
   const snapshot = gameController.getSnapshot()
   const undoTwice = gameMode.value === 'ai'
@@ -233,12 +292,14 @@ function undoMatch(): boolean {
 }
 
 function restartMatch(): void {
+  cancelAnalysisRequest(true)
   cancelAiSearch()
   gameController.restartGame()
   resetAiResult()
 }
 
 function toggleGameMode(): void {
+  cancelAnalysisRequest(true)
   cancelAiSearch()
   gameMode.value = gameMode.value === 'local' ? 'ai' : 'local'
   gameController.restartGame()
@@ -246,6 +307,7 @@ function toggleGameMode(): void {
 }
 
 function cycleAiDifficulty(): void {
+  cancelAnalysisRequest(true)
   cancelAiSearch()
   const order: ReadonlyArray<AiDifficulty> = ['easy', 'normal', 'hard', 'custom']
   const currentIndex = order.indexOf(aiDifficulty.value)
@@ -257,6 +319,7 @@ function cycleAiDifficulty(): void {
 }
 
 function openCustomDepthPicker(): void {
+  closeAnalysisPanel()
   cancelAiSearch()
   gameController.cancelSelection()
   depthPickerFocusIndex.value = customDepth.value - CUSTOM_DEPTH_MIN
@@ -287,6 +350,7 @@ function moveDepthPickerFocus(offset: number): void {
 }
 
 function openExperiencePanel(): void {
+  closeAnalysisPanel()
   gameController.cancelSelection()
   experienceFocusIndex.value = 0
   experienceOpen.value = true
@@ -294,6 +358,111 @@ function openExperiencePanel(): void {
 
 function closeExperiencePanel(): void {
   experienceOpen.value = false
+}
+
+function openAnalysisPanel(): void {
+  if (aiThinking.value || isFinished(gameController.getSnapshot().status)) {
+    return
+  }
+  gameController.cancelSelection()
+  depthPickerOpen.value = false
+  experienceOpen.value = false
+  analysisFocusIndex.value = 1
+  analysisResult.value = null
+  analysisCandidateRank.value = null
+  analysisPreviewRank.value = null
+  analysisError.value = null
+  analysisOpen.value = true
+  syncState()
+  void requestPositionAnalysis()
+}
+
+function closeAnalysisPanel(): void {
+  if (!analysisOpen.value && !analysisThinking.value) {
+    return
+  }
+  cancelAnalysisRequest(false)
+  analysisOpen.value = false
+}
+
+function selectAnalysisPreset(preset: AnalysisPresetKey): void {
+  if (analysisThinking.value) {
+    return
+  }
+  analysisPreset.value = preset
+  analysisFocusIndex.value = ['quick', 'standard', 'deep'].indexOf(preset)
+  void requestPositionAnalysis()
+}
+
+function previewAnalysisCandidate(rank: number | null): void {
+  if (rank !== null && !analysisResult.value?.candidates.some((candidate) => candidate.rank === rank)) {
+    return
+  }
+  analysisPreviewRank.value = rank
+}
+
+function confirmAnalysisCandidate(rank: number): void {
+  if (!analysisResult.value?.candidates.some((candidate) => candidate.rank === rank)) {
+    return
+  }
+  analysisCandidateRank.value = rank
+  analysisPreviewRank.value = null
+  analysisFocusIndex.value = rank + 4
+  closeAnalysisPanel()
+}
+
+async function requestPositionAnalysis(): Promise<void> {
+  const snapshot = gameController.getSnapshot()
+  if (
+    !analysisOpen.value
+    || aiThinking.value
+    || isFinished(snapshot.status)
+    || !remoteAiClient.isConfigured()
+  ) {
+    if (!remoteAiClient.isConfigured()) {
+      analysisError.value = '当前 APK 未配置云端分析服务'
+    }
+    return
+  }
+
+  const generation = analysisGeneration + 1
+  analysisGeneration = generation
+  analysisThinking.value = true
+  analysisCandidateRank.value = null
+  analysisPreviewRank.value = null
+  analysisError.value = null
+
+  try {
+    const result = await remoteAiClient.analyze({
+      initialBoard: INITIAL_BOARD,
+      board: snapshot.board,
+      player: snapshot.currentPlayer,
+      moves: snapshot.history,
+    }, getAnalysisPreset(analysisPreset.value).options)
+    const current = gameController.getSnapshot()
+    if (
+      generation !== analysisGeneration
+      || !analysisOpen.value
+      || current.board !== snapshot.board
+      || current.currentPlayer !== snapshot.currentPlayer
+      || current.history.length !== snapshot.history.length
+    ) {
+      return
+    }
+    analysisResult.value = result
+  } catch (error) {
+    if (
+      generation === analysisGeneration
+      && analysisOpen.value
+      && (!(error instanceof Error) || error.name !== 'AbortError')
+    ) {
+      analysisError.value = error instanceof Error ? error.message : '云端分析失败'
+    }
+  } finally {
+    if (generation === analysisGeneration) {
+      analysisThinking.value = false
+    }
+  }
 }
 
 function updateExperienceSettings(soundEnabled: boolean, motionEnabled: boolean): void {
@@ -462,6 +631,12 @@ function handleOpenExperience(): void {
   finishInteraction()
 }
 
+function handleOpenAnalysis(): void {
+  inputController.openAnalysisFromPointer()
+  hoveredSquare.value = null
+  finishInteraction()
+}
+
 function handleKeyDown(event: KeyboardEvent): void {
   if (depthPickerOpen.value) {
     let handled = true
@@ -480,6 +655,44 @@ function handleKeyDown(event: KeyboardEvent): void {
       }
     } else if (event.key === 'Escape' || event.key === 'Backspace') {
       closeCustomDepthPicker()
+    } else {
+      handled = false
+    }
+
+    if (handled) {
+      event.preventDefault()
+      hoveredSquare.value = null
+      inputController.activateRemote()
+      syncState()
+    }
+    return
+  }
+
+  if (analysisOpen.value) {
+    let handled = true
+    const maximumCandidateRank = analysisResult.value
+      ? Math.max(0, ...analysisResult.value.candidates.map((candidate) => candidate.rank))
+      : 0
+    const maximumFocusIndex = 4 + maximumCandidateRank
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+      analysisFocusIndex.value = Math.max(0, analysisFocusIndex.value - 1)
+    } else if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+      analysisFocusIndex.value = Math.min(maximumFocusIndex, analysisFocusIndex.value + 1)
+    } else if (event.key === 'Enter') {
+      if (analysisFocusIndex.value <= 2) {
+        const preset = (['quick', 'standard', 'deep'] as const)[analysisFocusIndex.value]
+        if (preset) {
+          selectAnalysisPreset(preset)
+        }
+      } else if (analysisFocusIndex.value === 3) {
+        void requestPositionAnalysis()
+      } else if (analysisFocusIndex.value === 4) {
+        closeAnalysisPanel()
+      } else {
+        confirmAnalysisCandidate(analysisFocusIndex.value - 4)
+      }
+    } else if (event.key === 'Escape' || event.key === 'Backspace') {
+      closeAnalysisPanel()
     } else {
       handled = false
     }
@@ -527,6 +740,7 @@ function handleKeyDown(event: KeyboardEvent): void {
 
 function handleVisibilityChange(): void {
   if (document.hidden) {
+    cancelAnalysisRequest(false)
     cancelAiSearch()
     return
   }
@@ -546,6 +760,10 @@ onMounted(() => {
       closeExperiencePanel()
       return true
     }
+    if (analysisOpen.value) {
+      closeAnalysisPanel()
+      return true
+    }
     const handled = inputController.handleAndroidBack()
     if (handled) {
       syncState()
@@ -559,6 +777,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('visibilitychange', handleVisibilityChange)
   delete window.__xiangqiHandleBack
   aiClient.dispose()
+  cancelAnalysisRequest(false)
   remoteAiClient.dispose()
   soundController.dispose()
 })
@@ -580,6 +799,7 @@ onBeforeUnmount(() => {
         :board="gameState.board"
         :legal-moves="gameState.legalMoves"
         :last-move="gameState.lastMove"
+        :analysis-move="analysisHighlightedMove"
         :checked-square="checkedGeneralSquare"
         :remote-focus-active="inputState.area === 'board'"
         :motion-enabled="experienceSettings.motionEnabled"
@@ -645,7 +865,7 @@ onBeforeUnmount(() => {
             </div>
           </dl>
 
-          <p class="hint">最右列再按 → 进入操作区 · 自定义深度可一次选取 · ← 或 BACK 返回</p>
+          <p class="hint">最右列再按 → 进入操作区 · 云端分析当前局面 · ← 或 BACK 返回</p>
         </aside>
 
         <nav class="game-actions" aria-label="对局操作">
@@ -711,6 +931,19 @@ onBeforeUnmount(() => {
           >
             <strong>设置与棋谱</strong>
             <small>{{ experienceSettings.soundEnabled ? '音效开' : '音效关' }} · {{ gameState.moveRecords.length }} 手</small>
+          </button>
+          <button
+            class="action-button action-button--wide"
+            :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 6 }"
+            type="button"
+            data-action-index="6"
+            aria-haspopup="dialog"
+            :aria-expanded="analysisOpen"
+            :disabled="aiThinking || isFinished(gameState.status)"
+            @click="handleOpenAnalysis"
+          >
+            <strong>局面分析</strong>
+            <small>{{ analysisActionLabel }}</small>
           </button>
         </nav>
       </div>
@@ -821,6 +1054,23 @@ onBeforeUnmount(() => {
         </div>
       </section>
     </div>
+
+    <AnalysisPanel
+      v-if="analysisOpen"
+      :input-mode="inputState.mode"
+      :preset="analysisPreset"
+      :focus-index="analysisFocusIndex"
+      :configured="analysisConfigured"
+      :thinking="analysisThinking"
+      :error="analysisError"
+      :result="analysisResult"
+      :selected-candidate-rank="analysisCandidateRank"
+      @close="closeAnalysisPanel"
+      @select-preset="selectAnalysisPreset"
+      @preview-candidate="previewAnalysisCandidate"
+      @select-candidate="confirmAnalysisCandidate"
+      @analyze="requestPositionAnalysis"
+    />
   </main>
 </template>
 
@@ -879,13 +1129,13 @@ onBeforeUnmount(() => {
 
 .status-panel {
   width: 100%;
-  padding: 1.8vh 2vw;
+  padding: 1.4vh 2vw;
   border-left: 2px solid rgba(205, 155, 88, 0.45);
   background: rgba(40, 26, 17, 0.55);
 }
 
 .phase-label {
-  margin: 0 0 1.6vh;
+  margin: 0 0 1.2vh;
   color: #b7986d;
   font-size: 1.2vw;
   letter-spacing: 0.3em;
@@ -894,7 +1144,7 @@ onBeforeUnmount(() => {
 .turn-card {
   display: flex;
   align-items: center;
-  padding: 1.6vh 1.4vw;
+  padding: 1.3vh 1.4vw;
   border: 1px solid rgba(224, 177, 103, 0.5);
   background: rgba(85, 42, 24, 0.46);
 }
@@ -953,7 +1203,7 @@ dl {
 dl div {
   display: flex;
   justify-content: space-between;
-  padding: 0.72vh 0;
+  padding: 0.5vh 0;
   border-bottom: 1px solid rgba(196, 154, 98, 0.2);
 }
 
@@ -983,9 +1233,9 @@ dd {
 .game-actions {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 1vh;
+  gap: 0.7vh;
   width: 100%;
-  margin-top: 1.4vh;
+  margin-top: 1vh;
 }
 
 .action-button {
@@ -995,8 +1245,8 @@ dd {
   justify-content: center;
   gap: 0.35vh;
   width: 100%;
-  min-height: 6.2vh;
-  padding: 0.8vh 0.6vw;
+  min-height: 5.2vh;
+  padding: 0.4vh 0.6vw;
   border: 2px solid rgba(201, 157, 94, 0.42);
   outline: none;
   background: rgba(58, 37, 23, 0.86);
@@ -1040,7 +1290,7 @@ dd {
 
 .action-button--wide {
   grid-column: 1 / -1;
-  min-height: 4.8vh;
+  min-height: 4.5vh;
   flex-direction: row;
 }
 
