@@ -5,11 +5,11 @@ import hmac
 import os
 import re
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -24,6 +24,9 @@ ENGINE_THREADS = max(1, int(os.getenv("XIANGQI_ENGINE_THREADS", "2")))
 ENGINE_HASH_MB = max(16, int(os.getenv("XIANGQI_ENGINE_HASH_MB", "256")))
 MAX_MOVETIME_MS = max(100, int(os.getenv("XIANGQI_MAX_MOVETIME_MS", "5000")))
 MAX_DEPTH = max(2, int(os.getenv("XIANGQI_MAX_DEPTH", "20")))
+MAX_ANALYSIS_MULTIPV = min(
+    5, max(1, int(os.getenv("XIANGQI_MAX_ANALYSIS_MULTIPV", "3")))
+)
 SEARCH_TIMEOUT_SECONDS = max(
     5, int(os.getenv("XIANGQI_SEARCH_TIMEOUT_SECONDS", "30"))
 )
@@ -46,6 +49,7 @@ INFO_NUMBER_PATTERNS = {
     "nps": re.compile(r"\bnps (\d+)"),
 }
 SCORE_PATTERN = re.compile(r"\bscore (cp|mate) (-?\d+)")
+MULTIPV_PATTERN = re.compile(r"\bmultipv (\d+)")
 PV_PATTERN = re.compile(r"\bpv ((?:[a-i][0-9][a-i][0-9](?:\s+|$))+)")
 BESTMOVE_PATTERN = re.compile(
     r"^bestmove (?P<move>[a-i][0-9][a-i][0-9]|none|\(none\))"
@@ -83,11 +87,21 @@ def validate_fen(value: str) -> str:
     return value
 
 
-class MoveRequest(BaseModel):
+def get_side_to_move(
+    fen: str,
+    moves: list[str],
+) -> Literal["red", "black"]:
+    side: Literal["red", "black"] = (
+        "red" if fen.split()[1] == "w" else "black"
+    )
+    if len(moves) % 2 == 1:
+        return "black" if side == "red" else "red"
+    return side
+
+
+class PositionRequest(BaseModel):
     fen: str
     moves: list[str] = Field(default_factory=list, max_length=300)
-    depth: int | None = Field(default=None, ge=2)
-    moveTimeMs: int | None = Field(default=None, ge=100)
 
     @field_validator("fen")
     @classmethod
@@ -100,6 +114,11 @@ class MoveRequest(BaseModel):
         if any(not MOVE_PATTERN.fullmatch(move) for move in moves):
             raise ValueError("走法必须使用 UCI 坐标格式，例如 h2e2")
         return moves
+
+
+class MoveRequest(PositionRequest):
+    depth: int | None = Field(default=None, ge=2)
+    moveTimeMs: int | None = Field(default=None, ge=100)
 
     @field_validator("moveTimeMs")
     @classmethod
@@ -122,6 +141,25 @@ class MoveRequest(BaseModel):
         return self
 
 
+class AnalysisRequest(PositionRequest):
+    moveTimeMs: int = Field(default=3000, ge=100)
+    multiPv: int = Field(default=MAX_ANALYSIS_MULTIPV, ge=1)
+
+    @field_validator("moveTimeMs")
+    @classmethod
+    def movetime_is_bounded(cls, value: int) -> int:
+        if value > MAX_MOVETIME_MS:
+            raise ValueError(f"分析时间不能超过 {MAX_MOVETIME_MS}ms")
+        return value
+
+    @field_validator("multiPv")
+    @classmethod
+    def multipv_is_bounded(cls, value: int) -> int:
+        if value > MAX_ANALYSIS_MULTIPV:
+            raise ValueError(f"候选着法不能超过 {MAX_ANALYSIS_MULTIPV} 条")
+        return value
+
+
 class EngineResult(BaseModel):
     bestmove: str
     ponder: str | None = None
@@ -133,6 +171,27 @@ class EngineResult(BaseModel):
     nps: int | None = None
     pv: list[str] = Field(default_factory=list)
     elapsedMs: int
+
+
+class AnalysisLine(BaseModel):
+    rank: int
+    move: str
+    scoreType: str | None = None
+    scoreRed: int | None = None
+    depth: int | None = None
+    seldepth: int | None = None
+    nodes: int | None = None
+    nps: int | None = None
+    pv: list[str] = Field(default_factory=list)
+
+
+class AnalysisResult(BaseModel):
+    sideToMove: Literal["red", "black"]
+    elapsedMs: int
+    depth: int | None = None
+    nodes: int | None = None
+    nps: int | None = None
+    lines: list[AnalysisLine] = Field(default_factory=list)
 
 
 class EngineUnavailable(RuntimeError):
@@ -194,18 +253,45 @@ class PikafishEngine:
         await self.close()
         await self.start()
 
+    async def _prepare_search(
+        self,
+        request: PositionRequest,
+        multi_pv: int,
+    ) -> None:
+        await self.start()
+        await self._send(f"setoption name MultiPV value {multi_pv}")
+        await self._send("ucinewgame")
+        await self._send("isready")
+        await self._read_until("readyok", timeout=10)
+
+        position = f"position fen {request.fen}"
+        if request.moves:
+            position += " moves " + " ".join(request.moves)
+        await self._send(position)
+
+    async def _restore_single_pv(self) -> None:
+        await self._send("setoption name MultiPV value 1")
+        await self._send("isready")
+        await self._read_until("readyok", timeout=10)
+
+    async def _cancel_active_search(self) -> None:
+        try:
+            await self._send("stop")
+            await self._read_search_result(timeout=2)
+            await self._restore_single_pv()
+        except (
+            asyncio.TimeoutError,
+            BrokenPipeError,
+            ConnectionResetError,
+            RuntimeError,
+            EngineUnavailable,
+        ):
+            await self.restart()
+
     async def search(self, request: MoveRequest) -> EngineResult:
         async with self.lock:
             try:
-                await self.start()
-                await self._send("ucinewgame")
-                await self._send("isready")
-                await self._read_until("readyok", timeout=10)
-
-                position = f"position fen {request.fen}"
-                if request.moves:
-                    position += " moves " + " ".join(request.moves)
-                await self._send(position)
+                await self._prepare_search(request, multi_pv=1)
 
                 started_at = time.monotonic()
                 if request.depth is not None:
@@ -223,6 +309,9 @@ class PikafishEngine:
                 )
                 result["elapsedMs"] = round((time.monotonic() - started_at) * 1000)
                 return EngineResult(**result)
+            except asyncio.CancelledError:
+                await self._cancel_active_search()
+                raise
             except (
                 asyncio.TimeoutError,
                 BrokenPipeError,
@@ -232,6 +321,45 @@ class PikafishEngine:
             ) as error:
                 await self.restart()
                 raise EngineUnavailable("Pikafish 搜索超时或进程异常") from error
+
+    async def analyze(self, request: AnalysisRequest) -> AnalysisResult:
+        async with self.lock:
+            try:
+                await self._prepare_search(request, multi_pv=request.multiPv)
+                started_at = time.monotonic()
+                await self._send(f"go movetime {request.moveTimeMs}")
+                side_to_move = get_side_to_move(request.fen, request.moves)
+                lines = await self._read_analysis_result(
+                    timeout=min(
+                        SEARCH_TIMEOUT_SECONDS,
+                        request.moveTimeMs / 1000 + 3,
+                    ),
+                    multi_pv=request.multiPv,
+                    side_to_move=side_to_move,
+                )
+                elapsed_ms = round((time.monotonic() - started_at) * 1000)
+                await self._restore_single_pv()
+                primary = lines[0]
+                return AnalysisResult(
+                    sideToMove=side_to_move,
+                    elapsedMs=elapsed_ms,
+                    depth=primary.depth,
+                    nodes=primary.nodes,
+                    nps=primary.nps,
+                    lines=lines,
+                )
+            except asyncio.CancelledError:
+                await self._cancel_active_search()
+                raise
+            except (
+                asyncio.TimeoutError,
+                BrokenPipeError,
+                ConnectionResetError,
+                RuntimeError,
+                EngineUnavailable,
+            ) as error:
+                await self.restart()
+                raise EngineUnavailable("Pikafish 分析超时或进程异常") from error
 
     async def _send(self, command: str) -> None:
         if not self.process or not self.process.stdin:
@@ -287,6 +415,64 @@ class PikafishEngine:
                 latest["ponder"] = bestmove_match.group("ponder")
                 return latest
 
+    async def _read_analysis_result(
+        self,
+        timeout: float,
+        multi_pv: int,
+        side_to_move: Literal["red", "black"],
+    ) -> list[AnalysisLine]:
+        deadline = time.monotonic() + timeout
+        latest_by_rank: dict[int, dict[str, object]] = {}
+        while True:
+            line = await self._readline(max(0.1, deadline - time.monotonic()))
+            if line.startswith("info "):
+                rank_match = MULTIPV_PATTERN.search(line)
+                if not rank_match:
+                    continue
+                rank = int(rank_match.group(1))
+                if rank < 1 or rank > multi_pv:
+                    continue
+
+                latest: dict[str, object] = {"rank": rank}
+                for name, pattern in INFO_NUMBER_PATTERNS.items():
+                    match = pattern.search(line)
+                    if match:
+                        latest[name] = int(match.group(1))
+                score_match = SCORE_PATTERN.search(line)
+                if score_match:
+                    latest["scoreType"] = score_match.group(1)
+                    raw_score = int(score_match.group(2))
+                    latest["scoreRed"] = (
+                        raw_score if side_to_move == "red" else -raw_score
+                    )
+                pv_match = PV_PATTERN.search(line)
+                if pv_match:
+                    latest["pv"] = pv_match.group(1).split()
+                if latest.get("pv"):
+                    latest_by_rank[rank] = latest
+                continue
+
+            bestmove_match = BESTMOVE_PATTERN.match(line)
+            if not bestmove_match:
+                continue
+            bestmove = bestmove_match.group("move")
+            if bestmove in {"none", "(none)"}:
+                raise EngineUnavailable("当前局面没有可用着法")
+
+            lines: list[AnalysisLine] = []
+            for rank in range(1, multi_pv + 1):
+                latest = latest_by_rank.get(rank)
+                if not latest:
+                    continue
+                pv = latest.get("pv")
+                if not isinstance(pv, list) or not pv:
+                    continue
+                lines.append(AnalysisLine(move=str(pv[0]), **latest))
+
+            if not lines:
+                lines.append(AnalysisLine(rank=1, move=bestmove, pv=[bestmove]))
+            return lines
+
 
 engine = PikafishEngine()
 
@@ -300,7 +486,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Xiangqi TV Engine API",
-    version="0.1.0",
+    version="0.2.0",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
@@ -333,6 +519,7 @@ async def health() -> dict[str, object]:
         "hashMb": ENGINE_HASH_MB,
         "maxDepth": MAX_DEPTH,
         "maxMoveTimeMs": MAX_MOVETIME_MS,
+        "maxAnalysisMultiPv": MAX_ANALYSIS_MULTIPV,
         "searchTimeoutSeconds": SEARCH_TIMEOUT_SECONDS,
     }
 
@@ -347,3 +534,41 @@ async def find_move(
         return await engine.search(request)
     except EngineUnavailable as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+async def wait_for_disconnect(request: Request) -> None:
+    while not await request.is_disconnected():
+        await asyncio.sleep(0.1)
+
+
+@app.post("/v1/xiangqi/analyze", response_model=AnalysisResult)
+async def analyze_position(
+    payload: AnalysisRequest,
+    request: Request,
+    _: Annotated[None, Depends(require_api_token)],
+) -> AnalysisResult:
+    del _
+    analysis_task = asyncio.create_task(engine.analyze(payload))
+    disconnect_task = asyncio.create_task(wait_for_disconnect(request))
+    try:
+        done, _pending = await asyncio.wait(
+            {analysis_task, disconnect_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if analysis_task in done:
+            return await analysis_task
+
+        analysis_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await analysis_task
+        raise HTTPException(status_code=499, detail="客户端已取消分析")
+    except EngineUnavailable as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    finally:
+        if not analysis_task.done():
+            analysis_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await analysis_task
+        disconnect_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await disconnect_task

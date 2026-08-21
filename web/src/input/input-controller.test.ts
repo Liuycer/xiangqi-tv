@@ -13,6 +13,7 @@ function createActions(): InputActions {
     cycleAiDifficulty: vi.fn(),
     openCustomDepthPicker: vi.fn(),
     openExperience: vi.fn(),
+    openAnalysis: vi.fn(),
   }
 }
 
@@ -100,6 +101,24 @@ describe('InputController', () => {
     controller.handleRemoteKey('ArrowRight')
     controller.handleRemoteKey('Enter')
     expect(actions.openExperience).toHaveBeenCalledTimes(1)
+
+    controller.handleRemoteKey('ArrowDown')
+    controller.handleRemoteKey('Enter')
+    expect(actions.openAnalysis).toHaveBeenCalledTimes(1)
+  })
+
+  it('routes the mouse analysis action to the seventh control', () => {
+    const actions = createActions()
+    const controller = new InputController(actions)
+
+    controller.openAnalysisFromPointer()
+
+    expect(controller.getSnapshot()).toMatchObject({
+      mode: 'mouse',
+      area: 'actions',
+      actionIndex: 6,
+    })
+    expect(actions.openAnalysis).toHaveBeenCalledTimes(1)
   })
 
   it('returns from the action area to the board with left or BACK', () => {

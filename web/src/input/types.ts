@@ -19,4 +19,5 @@ export interface InputActions {
   cycleAiDifficulty(): void
   openCustomDepthPicker(): void
   openExperience(): void
+  openAnalysis(): void
 }
