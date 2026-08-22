@@ -2,7 +2,7 @@ import { BOARD_COLS, BOARD_ROWS } from '../game/board'
 import type { Square } from '../game/types'
 import type { InputActions, InputArea, InputMode, InputSnapshot } from './types'
 
-const ACTION_COUNT = 7
+const ACTION_COUNT = 8
 
 const REMOTE_MOVEMENT: Readonly<Record<string, Readonly<Square>>> = {
   ArrowUp: { row: -1, col: 0 },
@@ -114,6 +114,13 @@ export class InputController {
     this.actions.openAnalysis()
   }
 
+  openHistoryFromPointer(): void {
+    this.mode = 'mouse'
+    this.area = 'actions'
+    this.actionIndex = 7
+    this.actions.openHistory()
+  }
+
   handleRemoteKey(key: string): boolean {
     const movement = REMOTE_MOVEMENT[key]
 
@@ -165,8 +172,10 @@ export class InputController {
           this.actions.openCustomDepthPicker()
         } else if (this.actionIndex === 5) {
           this.actions.openExperience()
-        } else {
+        } else if (this.actionIndex === 6) {
           this.actions.openAnalysis()
+        } else {
+          this.actions.openHistory()
         }
       } else {
         this.actions.selectSquare(this.cursor.row, this.cursor.col)

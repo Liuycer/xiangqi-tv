@@ -14,6 +14,7 @@ function createActions(): InputActions {
     openCustomDepthPicker: vi.fn(),
     openExperience: vi.fn(),
     openAnalysis: vi.fn(),
+    openHistory: vi.fn(),
   }
 }
 

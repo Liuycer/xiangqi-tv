@@ -22,6 +22,7 @@ import type { PositionAnalysisResult } from '../ai/analysis-types'
 import type { AiDifficulty, AiSearchResult } from '../ai/types'
 import AnalysisPanel from '../components/AnalysisPanel.vue'
 import ChessBoard from '../components/ChessBoard.vue'
+import HistoryPanel from '../components/HistoryPanel.vue'
 import { loadExperienceSettings, saveExperienceSettings } from '../experience/settings'
 import { SoundController } from '../experience/sound-controller'
 import { INITIAL_BOARD } from '../game/board'
@@ -33,7 +34,10 @@ import {
   loadOrCreatePlayerId,
   type AdaptiveProfile,
   type GameFinishPayload,
+  type GameHistoryDetail,
+  type GameHistorySummary,
 } from '../history/game-sync-client'
+import { buildReplayPosition } from '../history/history-replay'
 import { InputController } from '../input/input-controller'
 
 declare global {
@@ -103,9 +107,18 @@ const analysisCandidateRank = ref<number | null>(null)
 const analysisPreviewRank = ref<number | null>(null)
 const analysisPreset = ref<AnalysisPresetKey>('standard')
 const analysisFocusIndex = ref(1)
+const historyOpen = ref(false)
+const historyLoading = ref(false)
+const historyError = ref<string | null>(null)
+const historyItems = ref<ReadonlyArray<GameHistorySummary>>([])
+const historyDetail = ref<GameHistoryDetail | null>(null)
+const historySelectedGameId = ref<string | null>(null)
+const historyReplayPly = ref(0)
+const historyFocusIndex = ref(1)
 const soundController = new SoundController(experienceSettings.value.soundEnabled)
 let aiGeneration = 0
 let analysisGeneration = 0
+let historyGeneration = 0
 let gameVariationSeed = createGameVariationSeed()
 let openingPreference = advanceOpeningPreference()
 let previousOpeningMove = loadPreviousOpeningMove()
@@ -132,6 +145,7 @@ const inputController = new InputController({
   openCustomDepthPicker: () => openCustomDepthPicker(),
   openExperience: () => openExperiencePanel(),
   openAnalysis: () => openAnalysisPanel(),
+  openHistory: () => openHistoryPanel(),
 })
 
 const gameState = ref(gameController.getSnapshot())
@@ -158,6 +172,10 @@ const analysisHighlightedMove = computed(() => (
   analysisResult.value?.candidates.find(
     (candidate) => candidate.rank === analysisVisibleCandidateRank.value,
   )?.move ?? null
+))
+const historyReplay = computed(() => buildReplayPosition(
+  historyDetail.value?.moves.map((move) => move.uci) ?? [],
+  historyReplayPly.value,
 ))
 const analysisActionLabel = computed(() => {
   const candidate = analysisResult.value?.candidates.find(
@@ -514,6 +532,7 @@ function moveDepthPickerFocus(offset: number): void {
 
 function openExperiencePanel(): void {
   closeAnalysisPanel()
+  closeHistoryPanel()
   gameController.cancelSelection()
   experienceFocusIndex.value = 0
   experienceOpen.value = true
@@ -530,6 +549,7 @@ function openAnalysisPanel(): void {
   gameController.cancelSelection()
   depthPickerOpen.value = false
   experienceOpen.value = false
+  historyOpen.value = false
   analysisFocusIndex.value = 1
   analysisResult.value = null
   analysisCandidateRank.value = null
@@ -546,6 +566,92 @@ function closeAnalysisPanel(): void {
   }
   cancelAnalysisRequest(false)
   analysisOpen.value = false
+}
+
+function openHistoryPanel(): void {
+  gameController.cancelSelection()
+  depthPickerOpen.value = false
+  experienceOpen.value = false
+  closeAnalysisPanel()
+  historyOpen.value = true
+  historyFocusIndex.value = 1
+  historyError.value = null
+  syncState()
+  void loadGameHistory()
+}
+
+function closeHistoryPanel(): void {
+  historyGeneration += 1
+  historyOpen.value = false
+  historyLoading.value = false
+}
+
+async function loadGameHistory(): Promise<void> {
+  const generation = historyGeneration + 1
+  historyGeneration = generation
+  historyLoading.value = true
+  historyError.value = null
+  try {
+    await gameSyncClient.flush()
+    const page = await gameSyncClient.getGameHistory(playerId)
+    if (generation !== historyGeneration || !historyOpen.value) return
+    historyItems.value = page.items
+    const preferred = page.items.some((item) => item.id === historySelectedGameId.value)
+      ? historySelectedGameId.value
+      : page.items[0]?.id ?? null
+    historySelectedGameId.value = preferred
+    historyFocusIndex.value = preferred
+      ? Math.max(1, page.items.findIndex((item) => item.id === preferred) + 1)
+      : 0
+    if (preferred) {
+      await loadGameHistoryDetail(preferred, generation)
+    } else {
+      historyDetail.value = null
+      historyReplayPly.value = 0
+    }
+  } catch (error) {
+    if (generation === historyGeneration && historyOpen.value) {
+      historyError.value = error instanceof Error ? error.message : '读取历史对局失败'
+    }
+  } finally {
+    if (generation === historyGeneration) historyLoading.value = false
+  }
+}
+
+async function loadGameHistoryDetail(gameId: string, generation = historyGeneration): Promise<void> {
+  historySelectedGameId.value = gameId
+  historyDetail.value = null
+  historyReplayPly.value = 0
+  try {
+    const detail = await gameSyncClient.getGameHistoryDetail(playerId, gameId)
+    if (generation !== historyGeneration || !historyOpen.value || historySelectedGameId.value !== gameId) {
+      return
+    }
+    historyDetail.value = detail
+    historyReplayPly.value = detail.moves.length
+  } catch (error) {
+    if (generation === historyGeneration && historyOpen.value) {
+      historyError.value = error instanceof Error ? error.message : '读取对局详情失败'
+    }
+  }
+}
+
+function selectHistoryGame(gameId: string): void {
+  const index = historyItems.value.findIndex((item) => item.id === gameId)
+  if (index >= 0) historyFocusIndex.value = index + 1
+  historyError.value = null
+  void loadGameHistoryDetail(gameId)
+}
+
+function replayPreviousMove(): void {
+  historyReplayPly.value = Math.max(0, historyReplayPly.value - 1)
+}
+
+function replayNextMove(): void {
+  historyReplayPly.value = Math.min(
+    historyDetail.value?.moves.length ?? 0,
+    historyReplayPly.value + 1,
+  )
 }
 
 function selectAnalysisPreset(preset: AnalysisPresetKey): void {
@@ -860,7 +966,57 @@ function handleOpenAnalysis(): void {
   finishInteraction()
 }
 
+function handleOpenHistory(): void {
+  inputController.openHistoryFromPointer()
+  hoveredSquare.value = null
+  finishInteraction()
+}
+
 function handleKeyDown(event: KeyboardEvent): void {
+  if (historyOpen.value) {
+    let handled = true
+    const itemCount = historyItems.value.length
+    if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+      if (itemCount > 0) {
+        const offset = event.key === 'ArrowUp' ? -1 : 1
+        const current = Math.min(Math.max(historyFocusIndex.value - 1, 0), itemCount - 1)
+        const next = Math.min(Math.max(current + offset, 0), itemCount - 1)
+        const item = historyItems.value[next]
+        historyFocusIndex.value = next + 1
+        if (item && item.id !== historySelectedGameId.value) selectHistoryGame(item.id)
+      }
+    } else if (event.key === 'ArrowLeft') {
+      historyFocusIndex.value = itemCount + 1
+      replayPreviousMove()
+    } else if (event.key === 'ArrowRight') {
+      historyFocusIndex.value = itemCount + 2
+      replayNextMove()
+    } else if (event.key === 'Enter') {
+      if (historyFocusIndex.value === 0) {
+        closeHistoryPanel()
+      } else if (historyFocusIndex.value === itemCount + 1) {
+        replayPreviousMove()
+      } else if (historyFocusIndex.value === itemCount + 2) {
+        replayNextMove()
+      } else {
+        const item = historyItems.value[historyFocusIndex.value - 1]
+        if (item) selectHistoryGame(item.id)
+      }
+    } else if (event.key === 'Escape' || event.key === 'Backspace') {
+      closeHistoryPanel()
+    } else {
+      handled = false
+    }
+
+    if (handled) {
+      event.preventDefault()
+      hoveredSquare.value = null
+      inputController.activateRemote()
+      syncState()
+    }
+    return
+  }
+
   if (depthPickerOpen.value) {
     let handled = true
     if (event.key === 'ArrowLeft') {
@@ -980,6 +1136,10 @@ onMounted(() => {
   void gameSyncClient.flush()
   void refreshAdaptiveProfile()
   window.__xiangqiHandleBack = () => {
+    if (historyOpen.value) {
+      closeHistoryPanel()
+      return true
+    }
     if (depthPickerOpen.value) {
       closeCustomDepthPicker()
       return true
@@ -1166,7 +1326,7 @@ onBeforeUnmount(() => {
             <small>{{ experienceSettings.soundEnabled ? '音效开' : '音效关' }} · {{ gameState.moveRecords.length }} 手</small>
           </button>
           <button
-            class="action-button action-button--wide"
+            class="action-button"
             :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 6 }"
             type="button"
             data-action-index="6"
@@ -1177,6 +1337,18 @@ onBeforeUnmount(() => {
           >
             <strong>局面分析</strong>
             <small>{{ analysisActionLabel }}</small>
+          </button>
+          <button
+            class="action-button"
+            :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 7 }"
+            type="button"
+            data-action-index="7"
+            aria-haspopup="dialog"
+            :aria-expanded="historyOpen"
+            @click="handleOpenHistory"
+          >
+            <strong>历史对局</strong>
+            <small>服务器记录 · AI 复盘</small>
           </button>
         </nav>
       </div>
@@ -1324,6 +1496,23 @@ onBeforeUnmount(() => {
       @preview-candidate="previewAnalysisCandidate"
       @select-candidate="confirmAnalysisCandidate"
       @analyze="requestPositionAnalysis"
+    />
+
+    <HistoryPanel
+      v-if="historyOpen"
+      :input-mode="inputState.mode"
+      :items="historyItems"
+      :selected-game-id="historySelectedGameId"
+      :detail="historyDetail"
+      :replay="historyReplay"
+      :replay-ply="historyReplayPly"
+      :loading="historyLoading"
+      :error="historyError"
+      :focus-index="historyFocusIndex"
+      @close="closeHistoryPanel"
+      @select="selectHistoryGame"
+      @previous="replayPreviousMove"
+      @next="replayNextMove"
     />
   </main>
 </template>

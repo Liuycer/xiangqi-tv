@@ -35,6 +35,54 @@ export interface AdaptiveProfile {
   readonly adaptiveEnabled: boolean
 }
 
+export interface GameHistorySummary {
+  readonly id: string
+  readonly clientGameId: string
+  readonly mode: 'ai' | 'local'
+  readonly difficulty: string
+  readonly aiDepth: number | null
+  readonly adaptiveLevel: number | null
+  readonly state: 'active' | 'completed' | 'abandoned'
+  readonly result: 'red_win' | 'black_win' | 'draw' | 'abandoned' | null
+  readonly termination: string | null
+  readonly plyCount: number
+  readonly undoCount: number
+  readonly fallbackUsed: boolean
+  readonly settingsChanged: boolean
+  readonly analysisState: 'not_queued' | 'queued' | 'running' | 'completed' | 'failed'
+  readonly averageLossCp: number | null
+  readonly blunderCount: number
+  readonly startedAt: string
+  readonly endedAt: string | null
+}
+
+export interface GameHistoryMove {
+  readonly ply: number
+  readonly uci: string
+  readonly bestMove: string | null
+  readonly scoreBefore: number | null
+  readonly scoreAfter: number | null
+  readonly lossCp: number | null
+  readonly classification: string | null
+  readonly depth: number | null
+  readonly nodes: number | null
+  readonly elapsedMs: number | null
+}
+
+export interface GameHistoryDetail extends GameHistorySummary {
+  readonly initialFen: string
+  readonly ratingStatus: string
+  readonly ratingBefore: number | null
+  readonly ratingAfter: number | null
+  readonly moves: ReadonlyArray<GameHistoryMove>
+}
+
+export interface GameHistoryPage {
+  readonly total: number
+  readonly offset: number
+  readonly items: ReadonlyArray<GameHistorySummary>
+}
+
 export interface GameSnapshotPayload {
   readonly moves: ReadonlyArray<string>
   readonly currentPlayer: 'red' | 'black'
@@ -179,6 +227,28 @@ export class GameSyncClient {
   async resetAdaptiveProfile(playerId: string): Promise<AdaptiveProfile> {
     const payload = await this.requestJson('POST', '/v1/xiangqi/adaptive/reset', { playerId })
     return this.parseAdaptiveProfile(payload)
+  }
+
+  async getGameHistory(playerId: string, offset = 0): Promise<GameHistoryPage> {
+    const payload = await this.requestJson(
+      'GET',
+      `/v1/xiangqi/games?playerId=${encodeURIComponent(playerId)}&limit=20&offset=${offset}`,
+    )
+    if (typeof payload !== 'object' || payload === null || !Array.isArray((payload as GameHistoryPage).items)) {
+      throw new Error('历史对局列表格式无效')
+    }
+    return payload as GameHistoryPage
+  }
+
+  async getGameHistoryDetail(playerId: string, gameId: string): Promise<GameHistoryDetail> {
+    const payload = await this.requestJson(
+      'GET',
+      `/v1/xiangqi/games/${encodeURIComponent(gameId)}?playerId=${encodeURIComponent(playerId)}`,
+    )
+    if (typeof payload !== 'object' || payload === null || !Array.isArray((payload as GameHistoryDetail).moves)) {
+      throw new Error('历史对局详情格式无效')
+    }
+    return payload as GameHistoryDetail
   }
 
   flush(): Promise<void> {

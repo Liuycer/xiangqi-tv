@@ -338,6 +338,54 @@ class AdaptiveResetRequest(BaseModel):
     playerId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
 
 
+class GameHistorySummary(BaseModel):
+    id: str
+    clientGameId: str
+    mode: str
+    difficulty: str
+    aiDepth: int | None = None
+    adaptiveLevel: int | None = None
+    state: str
+    result: str | None = None
+    termination: str | None = None
+    plyCount: int
+    undoCount: int
+    fallbackUsed: bool
+    settingsChanged: bool
+    analysisState: str
+    averageLossCp: float | None = None
+    blunderCount: int
+    startedAt: str
+    endedAt: str | None = None
+
+
+class GameHistoryMove(BaseModel):
+    ply: int
+    uci: str
+    bestMove: str | None = None
+    scoreBefore: int | None = None
+    scoreAfter: int | None = None
+    lossCp: int | None = None
+    classification: str | None = None
+    depth: int | None = None
+    nodes: int | None = None
+    elapsedMs: int | None = None
+
+
+class GameHistoryDetail(GameHistorySummary):
+    initialFen: str
+    ratingStatus: str
+    ratingBefore: float | None = None
+    ratingAfter: float | None = None
+    moves: list[GameHistoryMove] = Field(default_factory=list)
+
+
+class GameHistoryList(BaseModel):
+    total: int
+    offset: int
+    items: list[GameHistorySummary] = Field(default_factory=list)
+
+
 class EngineUnavailable(RuntimeError):
     pass
 
@@ -1005,6 +1053,38 @@ async def get_adaptive_profile(
     profile["shadowMode"] = ADAPTIVE_SHADOW_MODE
     profile["adaptiveEnabled"] = ADAPTIVE_ENABLED
     return AdaptiveProfileResponse(**profile)
+
+
+@app.get("/v1/xiangqi/games", response_model=GameHistoryList)
+async def list_game_history(
+    _: Annotated[None, Depends(require_api_token)],
+    playerId: str = "primary",
+    limit: int = 20,
+    offset: int = 0,
+) -> GameHistoryList:
+    del _
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", playerId):
+        raise HTTPException(status_code=422, detail="playerId 格式无效")
+    if limit < 1 or limit > 50 or offset < 0:
+        raise HTTPException(status_code=422, detail="分页参数无效")
+    history = await game_store.list_games(playerId, limit=limit, offset=offset)
+    return GameHistoryList(**history)
+
+
+@app.get("/v1/xiangqi/games/{game_id}", response_model=GameHistoryDetail)
+async def get_game_history_detail(
+    game_id: str,
+    _: Annotated[None, Depends(require_api_token)],
+    playerId: str = "primary",
+) -> GameHistoryDetail:
+    del _
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", playerId):
+        raise HTTPException(status_code=422, detail="playerId 格式无效")
+    try:
+        detail = await game_store.get_game_detail(game_id, playerId)
+    except GameNotFound as error:
+        raise HTTPException(status_code=404, detail="历史对局不存在") from error
+    return GameHistoryDetail(**detail)
 
 
 @app.post("/v1/xiangqi/adaptive/lock", response_model=AdaptiveProfileResponse)

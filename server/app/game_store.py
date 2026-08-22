@@ -879,6 +879,150 @@ class GameStore:
             )
             return self._get_player_profile_sync(connection, player_id)
 
+    async def list_games(
+        self,
+        player_id: str,
+        *,
+        limit: int,
+        offset: int,
+    ) -> dict[str, Any]:
+        async with self.lock:
+            return await asyncio.to_thread(
+                self._list_games_sync,
+                player_id,
+                limit,
+                offset,
+            )
+
+    def _list_games_sync(
+        self,
+        player_id: str,
+        limit: int,
+        offset: int,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            total = int(connection.execute(
+                "SELECT COUNT(*) FROM games WHERE player_id = ?",
+                (player_id,),
+            ).fetchone()[0])
+            rows = connection.execute(
+                """
+                SELECT g.*, aj.state AS analysis_state,
+                       AVG(ma.loss_cp) AS average_loss_cp,
+                       SUM(CASE WHEN ma.classification = 'blunder' THEN 1 ELSE 0 END)
+                           AS blunder_count
+                FROM games AS g
+                LEFT JOIN analysis_jobs AS aj ON aj.game_id = g.id
+                LEFT JOIN move_analysis AS ma ON ma.game_id = g.id
+                WHERE g.player_id = ?
+                GROUP BY g.id
+                ORDER BY g.started_at DESC, g.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (player_id, limit, offset),
+            ).fetchall()
+            return {
+                "total": total,
+                "offset": offset,
+                "items": [self._row_to_history_summary(row) for row in rows],
+            }
+
+    async def get_game_detail(
+        self,
+        game_id: str,
+        player_id: str,
+    ) -> dict[str, Any]:
+        async with self.lock:
+            return await asyncio.to_thread(
+                self._get_game_detail_sync,
+                game_id,
+                player_id,
+            )
+
+    def _get_game_detail_sync(
+        self,
+        game_id: str,
+        player_id: str,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            game = connection.execute(
+                """
+                SELECT g.*, aj.state AS analysis_state,
+                       AVG(ma.loss_cp) AS average_loss_cp,
+                       SUM(CASE WHEN ma.classification = 'blunder' THEN 1 ELSE 0 END)
+                           AS blunder_count
+                FROM games AS g
+                LEFT JOIN analysis_jobs AS aj ON aj.game_id = g.id
+                LEFT JOIN move_analysis AS ma ON ma.game_id = g.id
+                WHERE (g.id = ? OR g.client_game_id = ?) AND g.player_id = ?
+                GROUP BY g.id
+                """,
+                (game_id, game_id, player_id),
+            ).fetchone()
+            if game is None:
+                raise GameNotFound(game_id)
+            moves = connection.execute(
+                """
+                SELECT gm.ply, gm.uci, ma.best_move, ma.score_before,
+                       ma.score_after, ma.loss_cp, ma.classification,
+                       ma.depth, ma.nodes, ma.elapsed_ms
+                FROM game_moves AS gm
+                LEFT JOIN move_analysis AS ma
+                    ON ma.game_id = gm.game_id AND ma.ply = gm.ply
+                WHERE gm.game_id = ?
+                ORDER BY gm.ply
+                """,
+                (game["id"],),
+            ).fetchall()
+            detail = self._row_to_history_summary(game)
+            detail["initialFen"] = game["initial_fen"]
+            detail["ratingStatus"] = game["rating_status"]
+            detail["ratingBefore"] = game["rating_before"]
+            detail["ratingAfter"] = game["rating_after"]
+            detail["moves"] = [
+                {
+                    "ply": int(row["ply"]),
+                    "uci": row["uci"],
+                    "bestMove": row["best_move"],
+                    "scoreBefore": row["score_before"],
+                    "scoreAfter": row["score_after"],
+                    "lossCp": row["loss_cp"],
+                    "classification": row["classification"],
+                    "depth": row["depth"],
+                    "nodes": row["nodes"],
+                    "elapsedMs": row["elapsed_ms"],
+                }
+                for row in moves
+            ]
+            return detail
+
+    @staticmethod
+    def _row_to_history_summary(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "clientGameId": row["client_game_id"],
+            "mode": row["mode"],
+            "difficulty": row["difficulty"],
+            "aiDepth": row["ai_depth"],
+            "adaptiveLevel": row["adaptive_level"],
+            "state": row["state"],
+            "result": row["result"],
+            "termination": row["termination"],
+            "plyCount": int(row["ply_count"]),
+            "undoCount": int(row["undo_count"]),
+            "fallbackUsed": bool(row["fallback_used"]),
+            "settingsChanged": bool(row["settings_changed"]),
+            "analysisState": row["analysis_state"] or "not_queued",
+            "averageLossCp": (
+                round(float(row["average_loss_cp"]), 1)
+                if row["average_loss_cp"] is not None
+                else None
+            ),
+            "blunderCount": int(row["blunder_count"] or 0),
+            "startedAt": row["started_at"],
+            "endedAt": row["ended_at"],
+        }
+
     async def finish_game(
         self,
         game_id: str,

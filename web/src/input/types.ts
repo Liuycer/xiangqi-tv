@@ -20,4 +20,5 @@ export interface InputActions {
   openCustomDepthPicker(): void
   openExperience(): void
   openAnalysis(): void
+  openHistory(): void
 }
