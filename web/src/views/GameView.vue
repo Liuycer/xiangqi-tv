@@ -31,6 +31,7 @@ import {
   createClientGameId,
   GameSyncClient,
   loadOrCreatePlayerId,
+  type AdaptiveProfile,
   type GameFinishPayload,
 } from '../history/game-sync-client'
 import { InputController } from '../input/input-controller'
@@ -63,6 +64,26 @@ function createGameVariationSeed(): number {
 
 const gameMode = ref<'local' | 'ai'>('ai')
 const aiDifficulty = ref<AiDifficulty>('normal')
+const adaptiveProfile = ref<AdaptiveProfile>({
+  playerId,
+  rating: 1200,
+  recommendedLevel: 2,
+  recommendedCode: 'A2',
+  recommendedLabel: '普通',
+  recommendedDepth: 3,
+  currentLevel: 2,
+  currentCode: 'A2',
+  currentLabel: '普通',
+  currentDepth: 3,
+  cloudEnabled: true,
+  humanize: true,
+  locked: false,
+  gamesUntilAdjustment: 3,
+  ratedGames: 0,
+  shadowMode: false,
+  adaptiveEnabled: false,
+})
+const adaptiveProfileError = ref<string | null>(null)
 const customDepth = ref(CUSTOM_DEPTH_DEFAULT)
 const aiThinking = ref(false)
 const aiError = ref<string | null>(null)
@@ -150,7 +171,9 @@ const analysisActionLabel = computed(() => {
 const targetAiDepth = computed(() => (
   aiDifficulty.value === 'custom'
     ? customDepth.value
-    : AI_DIFFICULTY_OPTIONS[aiDifficulty.value].maxDepth
+    : aiDifficulty.value === 'adaptive'
+      ? adaptiveProfile.value.currentDepth
+      : AI_DIFFICULTY_OPTIONS[aiDifficulty.value].maxDepth
 ))
 const difficultyLabel = computed(() => {
   if (aiDifficulty.value === 'easy') {
@@ -161,6 +184,9 @@ const difficultyLabel = computed(() => {
   }
   if (aiDifficulty.value === 'custom') {
     return `自定义 · D${customDepth.value}`
+  }
+  if (aiDifficulty.value === 'adaptive') {
+    return `自适应 · ${adaptiveProfile.value.currentCode} D${adaptiveProfile.value.currentDepth}`
   }
   return '普通 · D3'
 })
@@ -328,6 +354,9 @@ function beginTrackedGame(): void {
     difficulty: gameMode.value === 'local' ? 'local' : aiDifficulty.value,
     aiDepth: gameMode.value === 'local' ? null : targetAiDepth.value,
     variationSeed: gameMode.value === 'ai' ? gameVariationSeed : null,
+    adaptiveLevel: aiDifficulty.value === 'adaptive'
+      ? adaptiveProfile.value.currentLevel
+      : null,
     initialFen: boardToFen(INITIAL_BOARD, 'red'),
   })
 }
@@ -432,7 +461,7 @@ function toggleGameMode(): void {
 function cycleAiDifficulty(): void {
   cancelAnalysisRequest(true)
   cancelAiSearch()
-  const order: ReadonlyArray<AiDifficulty> = ['easy', 'normal', 'hard', 'custom']
+  const order: ReadonlyArray<AiDifficulty> = ['easy', 'normal', 'hard', 'adaptive', 'custom']
   const currentIndex = order.indexOf(aiDifficulty.value)
   aiDifficulty.value = order[(currentIndex + 1) % order.length] ?? 'normal'
   if (gameController.getSnapshot().history.length > 0) {
@@ -440,6 +469,9 @@ function cycleAiDifficulty(): void {
     queueTrackedSnapshot()
   }
   resetAiResult()
+  if (aiDifficulty.value === 'adaptive') {
+    void refreshAdaptiveProfile()
+  }
   if (aiDifficulty.value === 'custom') {
     openCustomDepthPicker()
   }
@@ -623,8 +655,46 @@ function activateExperienceControl(): void {
     toggleSound()
   } else if (experienceFocusIndex.value === 1) {
     toggleMotion()
+  } else if (experienceFocusIndex.value === 2) {
+    void toggleAdaptiveLock()
+  } else if (experienceFocusIndex.value === 3) {
+    void resetAdaptiveRating()
   } else {
     closeExperiencePanel()
+  }
+}
+
+async function refreshAdaptiveProfile(): Promise<void> {
+  if (!gameSyncClient.isConfigured()) {
+    adaptiveProfileError.value = '云端服务未配置'
+    return
+  }
+  try {
+    adaptiveProfile.value = await gameSyncClient.getAdaptiveProfile(playerId)
+    adaptiveProfileError.value = null
+  } catch (error) {
+    adaptiveProfileError.value = error instanceof Error ? error.message : '评级同步失败'
+  }
+}
+
+async function toggleAdaptiveLock(): Promise<void> {
+  try {
+    adaptiveProfile.value = await gameSyncClient.setAdaptiveLock(
+      playerId,
+      adaptiveProfile.value.locked ? null : adaptiveProfile.value.currentLevel,
+    )
+    adaptiveProfileError.value = null
+  } catch (error) {
+    adaptiveProfileError.value = error instanceof Error ? error.message : '锁定设置失败'
+  }
+}
+
+async function resetAdaptiveRating(): Promise<void> {
+  try {
+    adaptiveProfile.value = await gameSyncClient.resetAdaptiveProfile(playerId)
+    adaptiveProfileError.value = null
+  } catch (error) {
+    adaptiveProfileError.value = error instanceof Error ? error.message : '评级重置失败'
   }
 }
 
@@ -648,7 +718,13 @@ async function requestAiMoveIfNeeded(): Promise<void> {
     let result: AiSearchResult
     let source: 'local' | 'cloud' = 'local'
     let usedFallback = false
-    if (!shouldUseCloudAi(aiDifficulty.value)) {
+    const useCloudForTurn = aiDifficulty.value === 'adaptive'
+      ? adaptiveProfile.value.cloudEnabled
+      : shouldUseCloudAi(aiDifficulty.value)
+    const humanizeTurn = aiDifficulty.value === 'adaptive'
+      ? adaptiveProfile.value.humanize
+      : shouldHumanizeCloudAi(aiDifficulty.value)
+    if (!useCloudForTurn) {
       result = await aiClient.findMove(snapshot.board, 'black', 'easy')
     } else if (remoteAiClient.isConfigured()) {
       try {
@@ -658,7 +734,7 @@ async function requestAiMoveIfNeeded(): Promise<void> {
           player: 'black',
           moves: snapshot.history,
         }, targetAiDepth.value, {
-          humanize: shouldHumanizeCloudAi(aiDifficulty.value),
+          humanize: humanizeTurn,
           variationSeed: gameVariationSeed,
           openingPreference,
           avoidOpeningMove: previousOpeningMove ?? undefined,
@@ -695,7 +771,7 @@ async function requestAiMoveIfNeeded(): Promise<void> {
     if (
       result.move
       && source === 'cloud'
-      && aiDifficulty.value === 'normal'
+      && humanizeTurn
       && snapshot.history.length === 1
     ) {
       previousOpeningMove = moveToUci(result.move)
@@ -858,7 +934,7 @@ function handleKeyDown(event: KeyboardEvent): void {
     if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') {
       experienceFocusIndex.value = Math.max(0, experienceFocusIndex.value - 1)
     } else if (event.key === 'ArrowDown' || event.key === 'ArrowRight') {
-      experienceFocusIndex.value = Math.min(2, experienceFocusIndex.value + 1)
+      experienceFocusIndex.value = Math.min(4, experienceFocusIndex.value + 1)
     } else if (event.key === 'Enter') {
       activateExperienceControl()
     } else if (event.key === 'Escape' || event.key === 'Backspace') {
@@ -893,6 +969,7 @@ function handleVisibilityChange(): void {
   }
 
   void gameSyncClient.flush()
+  void refreshAdaptiveProfile()
   void requestAiMoveIfNeeded()
 }
 
@@ -901,6 +978,7 @@ onMounted(() => {
   document.addEventListener('visibilitychange', handleVisibilityChange)
   beginTrackedGame()
   void gameSyncClient.flush()
+  void refreshAdaptiveProfile()
   window.__xiangqiHandleBack = () => {
     if (depthPickerOpen.value) {
       closeCustomDepthPicker()
@@ -1001,6 +1079,10 @@ onBeforeUnmount(() => {
             <div v-if="gameMode === 'ai'">
               <dt>搜索节点</dt>
               <dd>{{ aiNodeSummary }}</dd>
+            </div>
+            <div v-if="gameMode === 'ai' && aiDifficulty === 'adaptive'">
+              <dt>自适应评级</dt>
+              <dd>{{ Math.round(adaptiveProfile.rating) }} · {{ adaptiveProfile.currentCode }}</dd>
             </div>
             <div>
               <dt>游戏状态</dt>
@@ -1170,14 +1252,35 @@ onBeforeUnmount(() => {
             <strong>{{ experienceSettings.motionEnabled ? '开启' : '关闭' }}</strong>
           </button>
           <button
-            class="setting-control setting-control--close"
+            class="setting-control"
             :class="{ 'setting-control--focused': inputState.mode === 'remote' && experienceFocusIndex === 2 }"
+            type="button"
+            :disabled="!adaptiveProfile.adaptiveEnabled"
+            @click="toggleAdaptiveLock"
+          >
+            <span>自适应等级</span>
+            <strong>{{ adaptiveProfile.locked ? `已锁定 ${adaptiveProfile.currentCode}` : `自动 · ${adaptiveProfile.currentCode}` }}</strong>
+          </button>
+          <button
+            class="setting-control"
+            :class="{ 'setting-control--focused': inputState.mode === 'remote' && experienceFocusIndex === 3 }"
+            type="button"
+            :disabled="!adaptiveProfile.adaptiveEnabled"
+            @click="resetAdaptiveRating"
+          >
+            <span>重置水平</span>
+            <strong>{{ adaptiveProfile.ratedGames }} 盘</strong>
+          </button>
+          <button
+            class="setting-control setting-control--close"
+            :class="{ 'setting-control--focused': inputState.mode === 'remote' && experienceFocusIndex === 4 }"
             type="button"
             @click="closeExperiencePanel"
           >
             <span>返回对局</span>
             <strong>关闭</strong>
           </button>
+          <p v-if="adaptiveProfileError" class="adaptive-setting-error">{{ adaptiveProfileError }}</p>
           <p class="dialog-hint">方向键切换 · OK 修改 · BACK 返回</p>
         </div>
 
@@ -1606,6 +1709,18 @@ dd {
 
 .setting-control strong {
   color: #f3d292;
+}
+
+.setting-control:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.adaptive-setting-error {
+  margin: 0.8vh 0 0;
+  color: #d88674;
+  font-family: system-ui, sans-serif;
+  font-size: 0.85vw;
 }
 
 .setting-control--close {

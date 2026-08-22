@@ -29,11 +29,12 @@ export const AI_DIFFICULTY_OPTIONS: Readonly<Record<AiDifficulty, AiSearchOption
   normal: { maxDepth: 3, timeLimitMs: 1_100, quiescenceDepth: 1 },
   hard: { maxDepth: 5, timeLimitMs: 3_200, quiescenceDepth: 2 },
   custom: { maxDepth: 5, timeLimitMs: 3_200, quiescenceDepth: 2 },
+  adaptive: { maxDepth: 3, timeLimitMs: 1_100, quiescenceDepth: 1 },
 }
 
 export function getLocalFallbackDifficulty(
   requestedDepth: number,
-): Exclude<AiDifficulty, 'custom'> {
+): 'easy' | 'normal' | 'hard' {
   if (requestedDepth <= AI_DIFFICULTY_OPTIONS.easy.maxDepth) {
     return 'easy'
   }

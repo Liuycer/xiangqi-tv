@@ -11,7 +11,28 @@ export interface GameStartPayload {
   readonly difficulty: 'easy' | 'normal' | 'hard' | 'custom' | 'adaptive' | 'local'
   readonly aiDepth: number | null
   readonly variationSeed: number | null
+  readonly adaptiveLevel: number | null
   readonly initialFen: string
+}
+
+export interface AdaptiveProfile {
+  readonly playerId: string
+  readonly rating: number
+  readonly recommendedLevel: number
+  readonly recommendedCode: string
+  readonly recommendedLabel: string
+  readonly recommendedDepth: number
+  readonly currentLevel: number
+  readonly currentCode: string
+  readonly currentLabel: string
+  readonly currentDepth: number
+  readonly cloudEnabled: boolean
+  readonly humanize: boolean
+  readonly locked: boolean
+  readonly gamesUntilAdjustment: number
+  readonly ratedGames: number
+  readonly shadowMode: boolean
+  readonly adaptiveEnabled: boolean
 }
 
 export interface GameSnapshotPayload {
@@ -139,6 +160,27 @@ export class GameSyncClient {
     })
   }
 
+  async getAdaptiveProfile(playerId: string): Promise<AdaptiveProfile> {
+    const payload = await this.requestJson(
+      'GET',
+      `/v1/xiangqi/adaptive/profile?playerId=${encodeURIComponent(playerId)}`,
+    )
+    return this.parseAdaptiveProfile(payload)
+  }
+
+  async setAdaptiveLock(playerId: string, level: number | null): Promise<AdaptiveProfile> {
+    const payload = await this.requestJson('POST', '/v1/xiangqi/adaptive/lock', {
+      playerId,
+      level,
+    })
+    return this.parseAdaptiveProfile(payload)
+  }
+
+  async resetAdaptiveProfile(playerId: string): Promise<AdaptiveProfile> {
+    const payload = await this.requestJson('POST', '/v1/xiangqi/adaptive/reset', { playerId })
+    return this.parseAdaptiveProfile(payload)
+  }
+
   flush(): Promise<void> {
     if (!this.isConfigured()) {
       return Promise.resolve()
@@ -158,6 +200,62 @@ export class GameSyncClient {
     this.outbox.push(operation)
     saveOperations(this.outbox)
     void this.flush()
+  }
+
+  private async requestJson(
+    method: 'GET' | 'POST',
+    path: string,
+    body?: Record<string, unknown>,
+  ): Promise<unknown> {
+    if (!this.isConfigured()) {
+      throw new Error('云端对局服务未配置')
+    }
+    const controller = new AbortController()
+    const timeoutId = globalThis.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+    try {
+      const response = await fetch(`${this.config.apiUrl.replace(/\/$/, '')}${path}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${this.config.apiToken}`,
+          ...(body ? { 'Content-Type': 'application/json' } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+        signal: controller.signal,
+      })
+      if (!response.ok) {
+        throw new Error(`自适应服务请求失败：HTTP ${response.status}`)
+      }
+      return await response.json() as unknown
+    } finally {
+      globalThis.clearTimeout(timeoutId)
+    }
+  }
+
+  private parseAdaptiveProfile(value: unknown): AdaptiveProfile {
+    if (typeof value !== 'object' || value === null) {
+      throw new Error('自适应服务返回格式无效')
+    }
+    const source = value as Record<string, unknown>
+    const numberFields = [
+      'rating', 'recommendedLevel', 'recommendedDepth', 'currentLevel',
+      'currentDepth', 'gamesUntilAdjustment', 'ratedGames',
+    ] as const
+    if (
+      typeof source.playerId !== 'string'
+      || typeof source.recommendedCode !== 'string'
+      || typeof source.recommendedLabel !== 'string'
+      || typeof source.currentCode !== 'string'
+      || typeof source.currentLabel !== 'string'
+      || numberFields.some((field) => typeof source[field] !== 'number')
+      || typeof source.cloudEnabled !== 'boolean'
+      || typeof source.humanize !== 'boolean'
+      || typeof source.locked !== 'boolean'
+      || typeof source.shadowMode !== 'boolean'
+      || typeof source.adaptiveEnabled !== 'boolean'
+    ) {
+      throw new Error('自适应服务返回字段无效')
+    }
+    return source as unknown as AdaptiveProfile
   }
 
   private async flushOutbox(): Promise<void> {

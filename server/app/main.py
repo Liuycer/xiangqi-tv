@@ -39,6 +39,12 @@ SEARCH_TIMEOUT_SECONDS = max(
 REVIEW_MOVE_TIME_MS = min(
     1_000, max(100, int(os.getenv("XIANGQI_REVIEW_MOVE_TIME_MS", "500")))
 )
+ADAPTIVE_ENABLED = os.getenv("XIANGQI_ADAPTIVE_ENABLED", "1").lower() in {
+    "1", "true", "yes", "on",
+}
+ADAPTIVE_SHADOW_MODE = os.getenv("XIANGQI_ADAPTIVE_SHADOW_MODE", "0").lower() in {
+    "1", "true", "yes", "on",
+}
 GAME_DATABASE_PATH = Path(
     os.getenv("XIANGQI_GAME_DATABASE_PATH", "/var/lib/xiangqi-api/xiangqi.db")
 )
@@ -243,6 +249,7 @@ class GameStartRequest(BaseModel):
     difficulty: Literal["easy", "normal", "hard", "custom", "adaptive", "local"]
     aiDepth: int | None = Field(default=None, ge=2, le=MAX_DEPTH)
     variationSeed: int | None = Field(default=None, ge=0, le=2_147_483_647)
+    adaptiveLevel: int | None = Field(default=None, ge=0, le=7)
     initialFen: str
 
     @field_validator("initialFen")
@@ -287,6 +294,7 @@ class StoredGame(BaseModel):
     mode: str
     difficulty: str
     aiDepth: int | None = None
+    adaptiveLevel: int | None = None
     state: str
     result: str | None = None
     termination: str | None = None
@@ -307,10 +315,27 @@ class AdaptiveProfileResponse(BaseModel):
     recommendedCode: str
     recommendedLabel: str
     recommendedDepth: int
+    currentLevel: int
+    currentCode: str
+    currentLabel: str
+    currentDepth: int
+    cloudEnabled: bool
+    humanize: bool
+    locked: bool
+    gamesUntilAdjustment: int
     ratedGames: int
     shadowMode: bool
     adaptiveEnabled: bool
     recentEvents: list[dict[str, object]] = Field(default_factory=list)
+
+
+class AdaptiveLockRequest(BaseModel):
+    playerId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    level: int | None = Field(default=None, ge=0, le=7)
+
+
+class AdaptiveResetRequest(BaseModel):
+    playerId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 class EngineUnavailable(RuntimeError):
@@ -944,6 +969,8 @@ async def health() -> dict[str, object]:
         "gameStorage": "sqlite",
         "reviewMoveTimeMs": REVIEW_MOVE_TIME_MS,
         "analysisQueue": queue_stats,
+        "adaptiveEnabled": ADAPTIVE_ENABLED,
+        "adaptiveShadowMode": ADAPTIVE_SHADOW_MODE,
     }
 
 
@@ -960,6 +987,7 @@ async def create_game(
         difficulty=payload.difficulty,
         ai_depth=payload.aiDepth,
         variation_seed=payload.variationSeed,
+        adaptive_level=payload.adaptiveLevel,
         initial_fen=payload.initialFen,
     )
     return StoredGame(**stored)
@@ -974,6 +1002,32 @@ async def get_adaptive_profile(
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", playerId):
         raise HTTPException(status_code=422, detail="playerId 格式无效")
     profile = await game_store.get_player_profile(playerId)
+    profile["shadowMode"] = ADAPTIVE_SHADOW_MODE
+    profile["adaptiveEnabled"] = ADAPTIVE_ENABLED
+    return AdaptiveProfileResponse(**profile)
+
+
+@app.post("/v1/xiangqi/adaptive/lock", response_model=AdaptiveProfileResponse)
+async def set_adaptive_lock(
+    payload: AdaptiveLockRequest,
+    _: Annotated[None, Depends(require_api_token)],
+) -> AdaptiveProfileResponse:
+    del _
+    profile = await game_store.set_adaptive_lock(payload.playerId, payload.level)
+    profile["shadowMode"] = ADAPTIVE_SHADOW_MODE
+    profile["adaptiveEnabled"] = ADAPTIVE_ENABLED
+    return AdaptiveProfileResponse(**profile)
+
+
+@app.post("/v1/xiangqi/adaptive/reset", response_model=AdaptiveProfileResponse)
+async def reset_adaptive_profile(
+    payload: AdaptiveResetRequest,
+    _: Annotated[None, Depends(require_api_token)],
+) -> AdaptiveProfileResponse:
+    del _
+    profile = await game_store.reset_player_rating(payload.playerId)
+    profile["shadowMode"] = ADAPTIVE_SHADOW_MODE
+    profile["adaptiveEnabled"] = ADAPTIVE_ENABLED
     return AdaptiveProfileResponse(**profile)
 
 

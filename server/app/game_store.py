@@ -159,6 +159,19 @@ class GameStore:
             )
             self._ensure_column(
                 connection,
+                "players",
+                "current_level",
+                "INTEGER NOT NULL DEFAULT 2",
+            )
+            self._ensure_column(
+                connection,
+                "players",
+                "games_since_adjustment",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(connection, "players", "locked_level", "INTEGER")
+            self._ensure_column(
+                connection,
                 "games",
                 "rating_status",
                 "TEXT NOT NULL DEFAULT 'pending'",
@@ -170,7 +183,7 @@ class GameStore:
                 (0, "A0", "初学", 2, 0, 0, 900),
                 (1, "A1", "入门", 3, 1, 1, 1050),
                 (2, "A2", "普通", 3, 1, 1, 1200),
-                (3, "A3", "进阶", 4, 1, 1, 1350),
+                (3, "A3", "进阶", 4, 1, 0, 1350),
                 (4, "A4", "业余中等", 5, 1, 0, 1500),
                 (5, "A5", "业余较强", 7, 1, 0, 1650),
                 (6, "A6", "高水平", 9, 1, 0, 1800),
@@ -178,10 +191,17 @@ class GameStore:
             )
             connection.executemany(
                 """
-                INSERT OR IGNORE INTO adaptive_profiles(
+                INSERT INTO adaptive_profiles(
                     level, code, label, engine_depth, cloud_enabled,
                     humanize, profile_rating
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(level) DO UPDATE SET
+                    code = excluded.code,
+                    label = excluded.label,
+                    engine_depth = excluded.engine_depth,
+                    cloud_enabled = excluded.cloud_enabled,
+                    humanize = excluded.humanize,
+                    profile_rating = excluded.profile_rating
                 """,
                 profiles,
             )
@@ -216,6 +236,7 @@ class GameStore:
         difficulty: str,
         ai_depth: int | None,
         variation_seed: int | None,
+        adaptive_level: int | None,
         initial_fen: str,
     ) -> dict[str, Any]:
         async with self.lock:
@@ -227,6 +248,7 @@ class GameStore:
                 difficulty,
                 ai_depth,
                 variation_seed,
+                adaptive_level,
                 initial_fen,
             )
 
@@ -238,6 +260,7 @@ class GameStore:
         difficulty: str,
         ai_depth: int | None,
         variation_seed: int | None,
+        adaptive_level: int | None,
         initial_fen: str,
     ) -> dict[str, Any]:
         with self._connect() as connection:
@@ -255,8 +278,8 @@ class GameStore:
                     """
                     INSERT INTO games(
                         id, client_game_id, player_id, mode, difficulty,
-                        ai_depth, variation_seed, initial_fen
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ai_depth, variation_seed, adaptive_level, initial_fen
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         game_id,
@@ -266,6 +289,7 @@ class GameStore:
                         difficulty,
                         ai_depth,
                         variation_seed,
+                        adaptive_level,
                         initial_fen,
                     ),
                 )
@@ -622,6 +646,8 @@ class GameStore:
             rating_after = rating_before
             recommendation_before = int(player["recommended_level"])
             recommendation_after = recommendation_before
+            current_level = int(player["current_level"])
+            games_since_adjustment = int(player["games_since_adjustment"])
             rated_games = int(player["rated_games"])
             ai_level = self._level_for_game(game)
             profile = connection.execute(
@@ -656,14 +682,47 @@ class GameStore:
                     recommendation_after = recommendation_before + 1
                 elif target_level < recommendation_before:
                     recommendation_after = recommendation_before - 1
+                recent_scores = [
+                    float(row["actual_score"])
+                    for row in connection.execute(
+                        """
+                        SELECT actual_score FROM rating_events
+                        WHERE player_id = ? AND eligible = 1
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT 5
+                        """,
+                        (player["id"],),
+                    ).fetchall()
+                    if row["actual_score"] is not None
+                ]
+                rolling_scores = [actual_score, *recent_scores]
+                win_rate = sum(rolling_scores) / len(rolling_scores)
+                next_games_since = games_since_adjustment + 1
+                locked_level = player["locked_level"]
+                if locked_level is not None:
+                    current_level = int(locked_level)
+                elif next_games_since >= 3:
+                    if target_level > current_level and win_rate > 0.65:
+                        current_level += 1
+                        next_games_since = 0
+                    elif target_level < current_level and win_rate < 0.35:
+                        current_level -= 1
+                        next_games_since = 0
                 connection.execute(
                     """
-                    UPDATE players
-                    SET rating = ?, recommended_level = ?, rated_games = rated_games + 1,
+                    UPDATE players SET
+                        rating = ?, recommended_level = ?, current_level = ?,
+                        games_since_adjustment = ?, rated_games = rated_games + 1,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (rating_after, recommendation_after, player["id"]),
+                    (
+                        rating_after,
+                        recommendation_after,
+                        current_level,
+                        next_games_since,
+                        player["id"],
+                    ),
                 )
 
             average_loss = (
@@ -731,11 +790,20 @@ class GameStore:
             (player_id,),
         ).fetchone()
         assert player is not None
-        profile = connection.execute(
+        recommended_profile = connection.execute(
             "SELECT * FROM adaptive_profiles WHERE level = ?",
             (player["recommended_level"],),
         ).fetchone()
-        assert profile is not None
+        current_level = (
+            int(player["locked_level"])
+            if player["locked_level"] is not None
+            else int(player["current_level"])
+        )
+        current_profile = connection.execute(
+            "SELECT * FROM adaptive_profiles WHERE level = ?",
+            (current_level,),
+        ).fetchone()
+        assert recommended_profile is not None and current_profile is not None
         recent_rows = connection.execute(
             """
             SELECT eligible, exclusion_reason, rating_before, rating_after,
@@ -751,14 +819,65 @@ class GameStore:
             "playerId": player_id,
             "rating": float(player["rating"]),
             "recommendedLevel": int(player["recommended_level"]),
-            "recommendedCode": profile["code"],
-            "recommendedLabel": profile["label"],
-            "recommendedDepth": int(profile["engine_depth"]),
+            "recommendedCode": recommended_profile["code"],
+            "recommendedLabel": recommended_profile["label"],
+            "recommendedDepth": int(recommended_profile["engine_depth"]),
+            "currentLevel": current_level,
+            "currentCode": current_profile["code"],
+            "currentLabel": current_profile["label"],
+            "currentDepth": int(current_profile["engine_depth"]),
+            "cloudEnabled": bool(current_profile["cloud_enabled"]),
+            "humanize": bool(current_profile["humanize"]),
+            "locked": player["locked_level"] is not None,
+            "gamesUntilAdjustment": max(0, 3 - int(player["games_since_adjustment"])),
             "ratedGames": int(player["rated_games"]),
-            "shadowMode": True,
-            "adaptiveEnabled": False,
             "recentEvents": [dict(row) for row in recent_rows],
         }
+
+    async def set_adaptive_lock(
+        self,
+        player_id: str,
+        level: int | None,
+    ) -> dict[str, Any]:
+        async with self.lock:
+            return await asyncio.to_thread(self._set_adaptive_lock_sync, player_id, level)
+
+    def _set_adaptive_lock_sync(
+        self,
+        player_id: str,
+        level: int | None,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("INSERT OR IGNORE INTO players(id) VALUES (?)", (player_id,))
+            connection.execute(
+                """
+                UPDATE players
+                SET locked_level = ?, current_level = COALESCE(?, current_level),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (level, level, player_id),
+            )
+            return self._get_player_profile_sync(connection, player_id)
+
+    async def reset_player_rating(self, player_id: str) -> dict[str, Any]:
+        async with self.lock:
+            return await asyncio.to_thread(self._reset_player_rating_sync, player_id)
+
+    def _reset_player_rating_sync(self, player_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("INSERT OR IGNORE INTO players(id) VALUES (?)", (player_id,))
+            connection.execute(
+                """
+                UPDATE players
+                SET rating = 1200, recommended_level = 2, current_level = 2,
+                    games_since_adjustment = 0, rated_games = 0,
+                    locked_level = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (player_id,),
+            )
+            return self._get_player_profile_sync(connection, player_id)
 
     async def finish_game(
         self,
@@ -857,6 +976,7 @@ class GameStore:
             "mode": row["mode"],
             "difficulty": row["difficulty"],
             "aiDepth": row["ai_depth"],
+            "adaptiveLevel": row["adaptive_level"],
             "state": row["state"],
             "result": row["result"],
             "termination": row["termination"],
