@@ -4,17 +4,22 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.net.Uri
 import android.os.Bundle
+import android.os.Build
 import android.view.View
 import android.view.ViewGroup
+import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
+import androidx.annotation.RequiresApi
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewClientCompat
 
 class MainActivity : Activity() {
     private lateinit var webView: WebView
+    private var predictiveBackCallback: Any? = null
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -58,6 +63,9 @@ class MainActivity : Activity() {
         setContentView(webView)
         webView.loadUrl(APP_URL)
         webView.requestFocus()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            predictiveBackCallback = Api33BackHandler.register(this)
+        }
     }
 
     override fun onResume() {
@@ -74,8 +82,11 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
+    @SuppressLint("GestureBackNavigation")
     @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
-    override fun onBackPressed() {
+    override fun onBackPressed() = handleBackRequest()
+
+    private fun handleBackRequest() {
         if (webView.canGoBack()) {
             webView.goBack()
             return
@@ -83,15 +94,16 @@ class MainActivity : Activity() {
 
         webView.evaluateJavascript(BACK_HANDLER_SCRIPT) { result ->
             if (result != "true" && !isFinishing && !isDestroyed) {
-                exitFromBack()
+                finish()
             }
         }
     }
 
-    @Suppress("DEPRECATION")
-    private fun exitFromBack() = super.onBackPressed()
-
     override fun onDestroy() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            predictiveBackCallback?.let { Api33BackHandler.unregister(this, it) }
+            predictiveBackCallback = null
+        }
         if (::webView.isInitialized) {
             webView.apply {
                 stopLoading()
@@ -125,6 +137,24 @@ class MainActivity : Activity() {
             uri.scheme == "https" &&
                 uri.host == APP_ASSET_HOST &&
                 uri.path?.startsWith(APP_ASSET_PATH) == true
+    }
+
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+    private object Api33BackHandler {
+        fun register(activity: MainActivity): Any {
+            val callback = OnBackInvokedCallback { activity.handleBackRequest() }
+            activity.onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                callback,
+            )
+            return callback
+        }
+
+        fun unregister(activity: MainActivity, callback: Any) {
+            activity.onBackInvokedDispatcher.unregisterOnBackInvokedCallback(
+                callback as OnBackInvokedCallback,
+            )
+        }
     }
 
     private companion object {

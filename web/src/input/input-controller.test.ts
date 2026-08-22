@@ -103,9 +103,13 @@ describe('InputController', () => {
     controller.handleRemoteKey('Enter')
     expect(actions.openExperience).toHaveBeenCalledTimes(1)
 
-    controller.handleRemoteKey('ArrowDown')
+    controller.handleRemoteKey('ArrowRight')
     controller.handleRemoteKey('Enter')
     expect(actions.openAnalysis).toHaveBeenCalledTimes(1)
+
+    controller.handleRemoteKey('ArrowRight')
+    controller.handleRemoteKey('Enter')
+    expect(actions.openHistory).toHaveBeenCalledTimes(1)
   })
 
   it('routes the mouse analysis action to the seventh control', () => {
@@ -120,6 +124,20 @@ describe('InputController', () => {
       actionIndex: 6,
     })
     expect(actions.openAnalysis).toHaveBeenCalledTimes(1)
+  })
+
+  it('routes the mouse history action to the eighth control', () => {
+    const actions = createActions()
+    const controller = new InputController(actions)
+
+    controller.openHistoryFromPointer()
+
+    expect(controller.getSnapshot()).toMatchObject({
+      mode: 'mouse',
+      area: 'actions',
+      actionIndex: 7,
+    })
+    expect(actions.openHistory).toHaveBeenCalledTimes(1)
   })
 
   it('returns from the action area to the board with left or BACK', () => {
