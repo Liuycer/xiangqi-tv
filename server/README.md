@@ -49,6 +49,11 @@ analysis share one engine lock, so a 2-core server never runs two Pikafish
 searches concurrently. A disconnected analysis client sends `stop` to the
 engine; `MultiPV` is restored to 1 before the next move search.
 
+Completed AI games are added to a persistent SQLite review queue. The worker
+analyzes one red move at a time with a bounded movetime, stores a checkpoint
+after every move, and yields the shared engine whenever an interactive move or
+analysis request is waiting. Interrupted jobs return to the queue on restart.
+
 ## Runtime configuration
 
 The systemd unit reads `/etc/xiangqi-engine-api.env`:
@@ -63,6 +68,7 @@ XIANGQI_MAX_MOVETIME_MS=5000
 XIANGQI_MAX_DEPTH=20
 XIANGQI_MAX_ANALYSIS_MULTIPV=3
 XIANGQI_SEARCH_TIMEOUT_SECONDS=30
+XIANGQI_REVIEW_MOVE_TIME_MS=500
 XIANGQI_ALLOWED_ORIGINS=https://appassets.androidplatform.net
 XIANGQI_API_TOKEN=replace-with-a-long-random-token
 ```

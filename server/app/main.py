@@ -36,6 +36,9 @@ MAX_ANALYSIS_MULTIPV = min(
 SEARCH_TIMEOUT_SECONDS = max(
     5, int(os.getenv("XIANGQI_SEARCH_TIMEOUT_SECONDS", "30"))
 )
+REVIEW_MOVE_TIME_MS = min(
+    1_000, max(100, int(os.getenv("XIANGQI_REVIEW_MOVE_TIME_MS", "500")))
+)
 GAME_DATABASE_PATH = Path(
     os.getenv("XIANGQI_GAME_DATABASE_PATH", "/var/lib/xiangqi-api/xiangqi.db")
 )
@@ -224,6 +227,15 @@ class AnalysisResult(BaseModel):
     lines: list[AnalysisLine] = Field(default_factory=list)
 
 
+class ReviewEvaluation(BaseModel):
+    bestmove: str
+    scoreType: str | None = None
+    scoreRed: int | None = None
+    depth: int | None = None
+    nodes: int | None = None
+    elapsedMs: int
+
+
 class GameStartRequest(BaseModel):
     clientGameId: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
     playerId: str = Field(default="primary", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
@@ -378,7 +390,17 @@ class PikafishEngine:
     def __init__(self) -> None:
         self.process: asyncio.subprocess.Process | None = None
         self.lock = asyncio.Lock()
+        self.interactive_waiters = 0
         self.name = "unknown"
+
+    @asynccontextmanager
+    async def interactive_slot(self):
+        self.interactive_waiters += 1
+        try:
+            async with self.lock:
+                yield
+        finally:
+            self.interactive_waiters -= 1
 
     async def start(self) -> None:
         if self.process and self.process.returncode is None:
@@ -465,7 +487,7 @@ class PikafishEngine:
             await self.restart()
 
     async def search(self, request: MoveRequest) -> EngineResult:
-        async with self.lock:
+        async with self.interactive_slot():
             try:
                 multi_pv = HUMANIZED_MULTIPV if request.humanize else 1
                 await self._prepare_search(request, multi_pv=multi_pv)
@@ -551,7 +573,7 @@ class PikafishEngine:
                 raise EngineUnavailable("Pikafish 搜索超时或进程异常") from error
 
     async def analyze(self, request: AnalysisRequest) -> AnalysisResult:
-        async with self.lock:
+        async with self.interactive_slot():
             try:
                 await self._prepare_search(request, multi_pv=request.multiPv)
                 started_at = time.monotonic()
@@ -588,6 +610,47 @@ class PikafishEngine:
             ) as error:
                 await self.restart()
                 raise EngineUnavailable("Pikafish 分析超时或进程异常") from error
+
+    async def review_evaluate(
+        self,
+        request: PositionRequest,
+        move_time_ms: int = REVIEW_MOVE_TIME_MS,
+    ) -> ReviewEvaluation:
+        while self.interactive_waiters > 0 or self.lock.locked():
+            await asyncio.sleep(0.05)
+        async with self.lock:
+            try:
+                await self._prepare_search(request, multi_pv=1)
+                started_at = time.monotonic()
+                await self._send(f"go movetime {move_time_ms}")
+                result = await self._read_search_result(
+                    timeout=min(SEARCH_TIMEOUT_SECONDS, move_time_ms / 1000 + 3)
+                )
+                elapsed_ms = round((time.monotonic() - started_at) * 1000)
+                score = result.get("score")
+                score_red = int(score) if isinstance(score, int) else None
+                if score_red is not None and get_side_to_move(request.fen, request.moves) == "black":
+                    score_red = -score_red
+                return ReviewEvaluation(
+                    bestmove=str(result["bestmove"]),
+                    scoreType=str(result["scoreType"]) if result.get("scoreType") else None,
+                    scoreRed=score_red,
+                    depth=int(result["depth"]) if isinstance(result.get("depth"), int) else None,
+                    nodes=int(result["nodes"]) if isinstance(result.get("nodes"), int) else None,
+                    elapsedMs=elapsed_ms,
+                )
+            except asyncio.CancelledError:
+                await self._cancel_active_search()
+                raise
+            except (
+                asyncio.TimeoutError,
+                BrokenPipeError,
+                ConnectionResetError,
+                RuntimeError,
+                EngineUnavailable,
+            ) as error:
+                await self.restart()
+                raise EngineUnavailable("Pikafish 赛后分析超时或进程异常") from error
 
     async def _send(self, command: str) -> None:
         if not self.process or not self.process.stdin:
@@ -706,11 +769,123 @@ engine = PikafishEngine()
 game_store = GameStore(GAME_DATABASE_PATH)
 
 
+def review_score(evaluation: ReviewEvaluation) -> int | None:
+    if evaluation.scoreRed is None:
+        return None
+    if evaluation.scoreType == "mate":
+        return 100_000 if evaluation.scoreRed > 0 else -100_000
+    return evaluation.scoreRed
+
+
+def classify_loss(loss_cp: int | None) -> str:
+    if loss_cp is None:
+        return "unknown"
+    if loss_cp < 30:
+        return "good"
+    if loss_cp < 80:
+        return "inaccuracy"
+    if loss_cp < 200:
+        return "mistake"
+    return "blunder"
+
+
+class PostGameAnalysisWorker:
+    def __init__(self, store: GameStore, pikafish: PikafishEngine) -> None:
+        self.store = store
+        self.pikafish = pikafish
+        self.task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        if self.task is None or self.task.done():
+            self.task = asyncio.create_task(self.run(), name="post-game-analysis")
+
+    async def close(self) -> None:
+        if self.task is None:
+            return
+        self.task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self.task
+        self.task = None
+
+    async def run(self) -> None:
+        while True:
+            processed = await self.run_once()
+            if not processed:
+                await asyncio.sleep(1)
+
+    async def run_once(self) -> bool:
+        job = await self.store.claim_analysis_job()
+        if job is None:
+            return False
+        job_id = str(job["id"])
+        game_id = str(job["gameId"])
+        try:
+            analysis_input = await self.store.get_analysis_input(game_id)
+            initial_fen = str(analysis_input["initialFen"])
+            moves = [str(move) for move in analysis_input["moves"]]
+            next_ply = max(1, int(job["nextPly"]))
+            if next_ply % 2 == 0:
+                next_ply += 1
+            for ply in range(next_ply, len(moves) + 1, 2):
+                played_move = moves[ply - 1]
+                before = await self.pikafish.review_evaluate(
+                    PositionRequest(fen=initial_fen, moves=moves[: ply - 1])
+                )
+                score_before = review_score(before)
+                elapsed_ms = before.elapsedMs
+                score_after: int | None
+                if before.bestmove == played_move:
+                    score_after = score_before
+                    loss_cp = 0
+                else:
+                    try:
+                        after = await self.pikafish.review_evaluate(
+                            PositionRequest(fen=initial_fen, moves=moves[:ply])
+                        )
+                        score_after = review_score(after)
+                        elapsed_ms += after.elapsedMs
+                    except EngineUnavailable:
+                        score_after = 100_000
+                    loss_cp = (
+                        max(0, score_before - score_after)
+                        if score_before is not None and score_after is not None
+                        else None
+                    )
+                await self.store.save_move_analysis(
+                    job_id=job_id,
+                    game_id=game_id,
+                    ply=ply,
+                    played_move=played_move,
+                    best_move=before.bestmove,
+                    score_before=score_before,
+                    score_after=score_after,
+                    loss_cp=loss_cp,
+                    classification=classify_loss(loss_cp),
+                    depth=before.depth,
+                    nodes=before.nodes,
+                    elapsed_ms=elapsed_ms,
+                )
+                await asyncio.sleep(0)
+            await self.store.complete_analysis_job(job_id)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning("post-game analysis failed game=%s error=%s", game_id, error)
+            await self.store.fail_analysis_job(job_id, str(error))
+            return True
+
+
+analysis_worker = PostGameAnalysisWorker(game_store, engine)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await game_store.initialize()
     await engine.start()
+    analysis_worker.start()
     yield
+    await analysis_worker.close()
     await engine.close()
 
 
@@ -742,6 +917,7 @@ def require_api_token(
 
 @app.get("/health")
 async def health() -> dict[str, object]:
+    queue_stats = await game_store.get_analysis_queue_stats()
     return {
         "status": "ok" if engine.process and engine.process.returncode is None else "error",
         "engine": engine.name,
@@ -752,6 +928,8 @@ async def health() -> dict[str, object]:
         "maxAnalysisMultiPv": MAX_ANALYSIS_MULTIPV,
         "searchTimeoutSeconds": SEARCH_TIMEOUT_SECONDS,
         "gameStorage": "sqlite",
+        "reviewMoveTimeMs": REVIEW_MOVE_TIME_MS,
+        "analysisQueue": queue_stats,
     }
 
 

@@ -80,6 +80,44 @@ class GameStore:
                     ON games(player_id, started_at DESC);
                 CREATE INDEX IF NOT EXISTS games_state_idx
                     ON games(state, updated_at);
+
+                CREATE TABLE IF NOT EXISTS analysis_jobs (
+                    id TEXT PRIMARY KEY,
+                    game_id TEXT NOT NULL UNIQUE REFERENCES games(id) ON DELETE CASCADE,
+                    state TEXT NOT NULL DEFAULT 'queued'
+                        CHECK (state IN ('queued', 'running', 'completed', 'failed')),
+                    next_ply INTEGER NOT NULL DEFAULT 1,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS move_analysis (
+                    game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+                    ply INTEGER NOT NULL,
+                    played_move TEXT NOT NULL,
+                    best_move TEXT NOT NULL,
+                    score_before INTEGER,
+                    score_after INTEGER,
+                    loss_cp INTEGER,
+                    classification TEXT NOT NULL,
+                    depth INTEGER,
+                    nodes INTEGER,
+                    elapsed_ms INTEGER NOT NULL,
+                    PRIMARY KEY (game_id, ply)
+                );
+
+                CREATE INDEX IF NOT EXISTS analysis_jobs_state_idx
+                    ON analysis_jobs(state, updated_at);
+                """
+            )
+            connection.execute(
+                """
+                UPDATE analysis_jobs
+                SET state = 'queued', updated_at = CURRENT_TIMESTAMP
+                WHERE state = 'running'
                 """
             )
 
@@ -220,6 +258,198 @@ class GameStore:
             assert updated is not None
             return self._row_to_game(updated)
 
+    async def claim_analysis_job(self) -> dict[str, Any] | None:
+        async with self.lock:
+            return await asyncio.to_thread(self._claim_analysis_job_sync)
+
+    def _claim_analysis_job_sync(self) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM analysis_jobs
+                WHERE state = 'queued' AND attempts < 3
+                ORDER BY created_at, id
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                UPDATE analysis_jobs
+                SET state = 'running', attempts = attempts + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (row["id"],),
+            )
+            return {
+                "id": row["id"],
+                "gameId": row["game_id"],
+                "nextPly": row["next_ply"],
+                "attempts": row["attempts"] + 1,
+            }
+
+    async def get_analysis_input(self, game_id: str) -> dict[str, Any]:
+        async with self.lock:
+            return await asyncio.to_thread(self._get_analysis_input_sync, game_id)
+
+    def _get_analysis_input_sync(self, game_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            game = connection.execute(
+                "SELECT * FROM games WHERE id = ?",
+                (game_id,),
+            ).fetchone()
+            if game is None:
+                raise GameNotFound(game_id)
+            moves = connection.execute(
+                "SELECT uci FROM game_moves WHERE game_id = ? ORDER BY ply",
+                (game_id,),
+            ).fetchall()
+            return {
+                "gameId": game_id,
+                "initialFen": game["initial_fen"],
+                "moves": [row["uci"] for row in moves],
+            }
+
+    async def save_move_analysis(
+        self,
+        *,
+        job_id: str,
+        game_id: str,
+        ply: int,
+        played_move: str,
+        best_move: str,
+        score_before: int | None,
+        score_after: int | None,
+        loss_cp: int | None,
+        classification: str,
+        depth: int | None,
+        nodes: int | None,
+        elapsed_ms: int,
+    ) -> None:
+        async with self.lock:
+            await asyncio.to_thread(
+                self._save_move_analysis_sync,
+                job_id,
+                game_id,
+                ply,
+                played_move,
+                best_move,
+                score_before,
+                score_after,
+                loss_cp,
+                classification,
+                depth,
+                nodes,
+                elapsed_ms,
+            )
+
+    def _save_move_analysis_sync(
+        self,
+        job_id: str,
+        game_id: str,
+        ply: int,
+        played_move: str,
+        best_move: str,
+        score_before: int | None,
+        score_after: int | None,
+        loss_cp: int | None,
+        classification: str,
+        depth: int | None,
+        nodes: int | None,
+        elapsed_ms: int,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO move_analysis(
+                    game_id, ply, played_move, best_move, score_before,
+                    score_after, loss_cp, classification, depth, nodes, elapsed_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(game_id, ply) DO UPDATE SET
+                    played_move = excluded.played_move,
+                    best_move = excluded.best_move,
+                    score_before = excluded.score_before,
+                    score_after = excluded.score_after,
+                    loss_cp = excluded.loss_cp,
+                    classification = excluded.classification,
+                    depth = excluded.depth,
+                    nodes = excluded.nodes,
+                    elapsed_ms = excluded.elapsed_ms
+                """,
+                (
+                    game_id,
+                    ply,
+                    played_move,
+                    best_move,
+                    score_before,
+                    score_after,
+                    loss_cp,
+                    classification,
+                    depth,
+                    nodes,
+                    elapsed_ms,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE analysis_jobs
+                SET next_ply = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (ply + 2, job_id),
+            )
+
+    async def complete_analysis_job(self, job_id: str) -> None:
+        async with self.lock:
+            await asyncio.to_thread(self._complete_analysis_job_sync, job_id)
+
+    def _complete_analysis_job_sync(self, job_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE analysis_jobs
+                SET state = 'completed', last_error = NULL,
+                    updated_at = CURRENT_TIMESTAMP, completed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (job_id,),
+            )
+
+    async def fail_analysis_job(self, job_id: str, error: str) -> None:
+        async with self.lock:
+            await asyncio.to_thread(self._fail_analysis_job_sync, job_id, error)
+
+    def _fail_analysis_job_sync(self, job_id: str, error: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE analysis_jobs
+                SET state = CASE WHEN attempts >= 3 THEN 'failed' ELSE 'queued' END,
+                    last_error = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (error[:500], job_id),
+            )
+
+    async def get_analysis_queue_stats(self) -> dict[str, int]:
+        async with self.lock:
+            return await asyncio.to_thread(self._get_analysis_queue_stats_sync)
+
+    def _get_analysis_queue_stats_sync(self) -> dict[str, int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT state, COUNT(*) AS count FROM analysis_jobs GROUP BY state"
+            ).fetchall()
+            counts = {str(row["state"]): int(row["count"]) for row in rows}
+            return {
+                "queued": counts.get("queued", 0),
+                "running": counts.get("running", 0),
+                "completed": counts.get("completed", 0),
+                "failed": counts.get("failed", 0),
+            }
+
     async def finish_game(
         self,
         game_id: str,
@@ -294,6 +524,14 @@ class GameStore:
                         stored_id,
                     ),
                 )
+                if state == "completed" and game["mode"] == "ai":
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO analysis_jobs(id, game_id)
+                        VALUES (?, ?)
+                        """,
+                        (str(uuid.uuid4()), stored_id),
+                    )
             updated = connection.execute(
                 "SELECT * FROM games WHERE id = ?",
                 (game["id"],),
