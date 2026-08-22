@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Xiangqi TV database backup
+
+[Timer]
+OnCalendar=*-*-* 04:15:00 Asia/Shanghai
+RandomizedDelaySec=20m
+Persistent=true
+Unit=xiangqi-database-backup.service
+
+[Install]
+WantedBy=timers.target
+

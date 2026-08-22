@@ -4,11 +4,27 @@ import asyncio
 import math
 import sqlite3
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 
 GameState = Literal["active", "completed", "abandoned"]
+SCHEMA_VERSION = 4
+
+
+@dataclass(frozen=True)
+class AdaptivePolicy:
+    minimum_plies: int = 10
+    provisional_games: int = 10
+    provisional_k: float = 40.0
+    established_k: float = 24.0
+    adjustment_interval: int = 3
+    rolling_window: int = 5
+    promote_score: float = 0.65
+    demote_score: float = 0.35
+    initial_rating: float = 1200.0
+    initial_level: int = 2
 
 
 class GameNotFound(RuntimeError):
@@ -16,8 +32,13 @@ class GameNotFound(RuntimeError):
 
 
 class GameStore:
-    def __init__(self, database_path: Path) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        adaptive_policy: AdaptivePolicy = AdaptivePolicy(),
+    ) -> None:
         self.database_path = database_path
+        self.adaptive_policy = adaptive_policy
         self.lock = asyncio.Lock()
 
     def _connect(self) -> sqlite3.Connection:
@@ -26,6 +47,21 @@ class GameStore:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 10000")
         return connection
+
+    def _ensure_player_sync(self, connection: sqlite3.Connection, player_id: str) -> None:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO players(
+                id, rating, recommended_level, current_level
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                player_id,
+                self.adaptive_policy.initial_rating,
+                self.adaptive_policy.initial_level,
+                self.adaptive_policy.initial_level,
+            ),
+        )
 
     async def initialize(self) -> None:
         async with self.lock:
@@ -212,6 +248,7 @@ class GameStore:
                 WHERE state = 'running'
                 """
             )
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     @staticmethod
     def _ensure_column(
@@ -264,10 +301,7 @@ class GameStore:
         initial_fen: str,
     ) -> dict[str, Any]:
         with self._connect() as connection:
-            connection.execute(
-                "INSERT OR IGNORE INTO players(id) VALUES (?)",
-                (player_id,),
-            )
+            self._ensure_player_sync(connection, player_id)
             existing = connection.execute(
                 "SELECT * FROM games WHERE client_game_id = ?",
                 (client_game_id,),
@@ -635,7 +669,7 @@ class GameStore:
                 exclusion_reason = "settings_changed"
             elif game["undo_count"] > 0:
                 exclusion_reason = "undo_used"
-            elif game["ply_count"] < 10:
+            elif game["ply_count"] < self.adaptive_policy.minimum_plies:
                 exclusion_reason = "too_short"
             elif analysis_job is None or analysis_job["state"] != "completed":
                 exclusion_reason = "analysis_incomplete"
@@ -666,7 +700,11 @@ class GameStore:
                 expected_score = 1.0 / (
                     1.0 + math.pow(10.0, (float(profile["profile_rating"]) - rating_before) / 400.0)
                 )
-                k_factor = 40.0 if rated_games < 10 else 24.0
+                k_factor = (
+                    self.adaptive_policy.provisional_k
+                    if rated_games < self.adaptive_policy.provisional_games
+                    else self.adaptive_policy.established_k
+                )
                 rating_after = round(rating_before + k_factor * (actual_score - expected_score), 2)
                 target = connection.execute(
                     """
@@ -689,9 +727,9 @@ class GameStore:
                         SELECT actual_score FROM rating_events
                         WHERE player_id = ? AND eligible = 1
                         ORDER BY created_at DESC, id DESC
-                        LIMIT 5
+                        LIMIT ?
                         """,
-                        (player["id"],),
+                        (player["id"], max(0, self.adaptive_policy.rolling_window - 1)),
                     ).fetchall()
                     if row["actual_score"] is not None
                 ]
@@ -701,11 +739,11 @@ class GameStore:
                 locked_level = player["locked_level"]
                 if locked_level is not None:
                     current_level = int(locked_level)
-                elif next_games_since >= 3:
-                    if target_level > current_level and win_rate > 0.65:
+                elif next_games_since >= self.adaptive_policy.adjustment_interval:
+                    if target_level > current_level and win_rate > self.adaptive_policy.promote_score:
                         current_level += 1
                         next_games_since = 0
-                    elif target_level < current_level and win_rate < 0.35:
+                    elif target_level < current_level and win_rate < self.adaptive_policy.demote_score:
                         current_level -= 1
                         next_games_since = 0
                 connection.execute(
@@ -777,7 +815,7 @@ class GameStore:
 
     def _get_player_profile_by_id_sync(self, player_id: str) -> dict[str, Any]:
         with self._connect() as connection:
-            connection.execute("INSERT OR IGNORE INTO players(id) VALUES (?)", (player_id,))
+            self._ensure_player_sync(connection, player_id)
             return self._get_player_profile_sync(connection, player_id)
 
     def _get_player_profile_sync(
@@ -829,7 +867,11 @@ class GameStore:
             "cloudEnabled": bool(current_profile["cloud_enabled"]),
             "humanize": bool(current_profile["humanize"]),
             "locked": player["locked_level"] is not None,
-            "gamesUntilAdjustment": max(0, 3 - int(player["games_since_adjustment"])),
+            "gamesUntilAdjustment": max(
+                0,
+                self.adaptive_policy.adjustment_interval
+                - int(player["games_since_adjustment"]),
+            ),
             "ratedGames": int(player["rated_games"]),
             "recentEvents": [dict(row) for row in recent_rows],
         }
@@ -848,7 +890,7 @@ class GameStore:
         level: int | None,
     ) -> dict[str, Any]:
         with self._connect() as connection:
-            connection.execute("INSERT OR IGNORE INTO players(id) VALUES (?)", (player_id,))
+            self._ensure_player_sync(connection, player_id)
             connection.execute(
                 """
                 UPDATE players
@@ -866,18 +908,75 @@ class GameStore:
 
     def _reset_player_rating_sync(self, player_id: str) -> dict[str, Any]:
         with self._connect() as connection:
-            connection.execute("INSERT OR IGNORE INTO players(id) VALUES (?)", (player_id,))
+            self._ensure_player_sync(connection, player_id)
             connection.execute(
                 """
                 UPDATE players
-                SET rating = 1200, recommended_level = 2, current_level = 2,
+                SET rating = ?, recommended_level = ?, current_level = ?,
                     games_since_adjustment = 0, rated_games = 0,
                     locked_level = NULL, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (player_id,),
+                (
+                    self.adaptive_policy.initial_rating,
+                    self.adaptive_policy.initial_level,
+                    self.adaptive_policy.initial_level,
+                    player_id,
+                ),
             )
             return self._get_player_profile_sync(connection, player_id)
+
+    async def get_operational_stats(self) -> dict[str, Any]:
+        async with self.lock:
+            return await asyncio.to_thread(self._get_operational_stats_sync)
+
+    def _get_operational_stats_sync(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            game_counts = {
+                str(row["state"]): int(row["count"])
+                for row in connection.execute(
+                    "SELECT state, COUNT(*) AS count FROM games GROUP BY state"
+                ).fetchall()
+            }
+            player_count = int(connection.execute("SELECT COUNT(*) FROM players").fetchone()[0])
+            analyzed_moves = int(
+                connection.execute("SELECT COUNT(*) FROM move_analysis").fetchone()[0]
+            )
+            rating_counts = connection.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN eligible = 1 THEN 1 ELSE 0 END) AS eligible
+                FROM rating_events
+                """
+            ).fetchone()
+            schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        database_files = (
+            self.database_path,
+            Path(f"{self.database_path}-wal"),
+            Path(f"{self.database_path}-shm"),
+        )
+        database_bytes = sum(
+            path.stat().st_size for path in database_files if path.exists()
+        )
+        rating_total = int(rating_counts["total"] or 0)
+        rating_eligible = int(rating_counts["eligible"] or 0)
+        return {
+            "schemaVersion": schema_version,
+            "databaseBytes": database_bytes,
+            "players": player_count,
+            "games": {
+                "total": sum(game_counts.values()),
+                "active": game_counts.get("active", 0),
+                "completed": game_counts.get("completed", 0),
+                "abandoned": game_counts.get("abandoned", 0),
+            },
+            "analyzedMoves": analyzed_moves,
+            "ratings": {
+                "total": rating_total,
+                "eligible": rating_eligible,
+                "excluded": rating_total - rating_eligible,
+            },
+        }
 
     async def list_games(
         self,

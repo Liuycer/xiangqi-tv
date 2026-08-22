@@ -77,6 +77,21 @@ XIANGQI_SEARCH_TIMEOUT_SECONDS=30
 XIANGQI_REVIEW_MOVE_TIME_MS=500
 XIANGQI_ADAPTIVE_ENABLED=1
 XIANGQI_ADAPTIVE_SHADOW_MODE=0
+XIANGQI_ADAPTIVE_MINIMUM_PLIES=10
+XIANGQI_ADAPTIVE_PROVISIONAL_GAMES=10
+XIANGQI_ADAPTIVE_PROVISIONAL_K=40
+XIANGQI_ADAPTIVE_ESTABLISHED_K=24
+XIANGQI_ADAPTIVE_ADJUSTMENT_INTERVAL=3
+XIANGQI_ADAPTIVE_ROLLING_WINDOW=5
+XIANGQI_ADAPTIVE_PROMOTE_SCORE=0.65
+XIANGQI_ADAPTIVE_DEMOTE_SCORE=0.35
+XIANGQI_ADAPTIVE_INITIAL_RATING=1200
+XIANGQI_ADAPTIVE_INITIAL_LEVEL=2
+XIANGQI_REVIEW_GOOD_MAX_CP=30
+XIANGQI_REVIEW_INACCURACY_MAX_CP=80
+XIANGQI_REVIEW_MISTAKE_MAX_CP=200
+XIANGQI_BACKUP_DIRECTORY=/var/backups/xiangqi-api
+XIANGQI_BACKUP_RETENTION_DAYS=14
 XIANGQI_ALLOWED_ORIGINS=https://appassets.androidplatform.net
 XIANGQI_API_TOKEN=replace-with-a-long-random-token
 ```
@@ -88,6 +103,20 @@ analysis endpoints, and the authenticated `/v1/xiangqi/games` lifecycle API.
 They apply a per-IP request limit and proxy to the localhost Uvicorn service.
 Certbot can then attach the TLS
 certificate and HTTP-to-HTTPS redirect to the domain server block.
+
+## Metrics and backups
+
+`GET /v1/xiangqi/metrics` is authenticated and reports API latency/error
+counters, engine contention, review queue state, database size and the active
+adaptive calibration values. `/health` remains a small unauthenticated liveness
+response and does not expose player data.
+
+Install `systemd/xiangqi-database-backup.service` and its timer, create
+`/var/backups/xiangqi-api` owned by the `xiangqi` service user, then enable the
+timer. It creates an online gzip-compressed SQLite snapshot every day and keeps
+14 days by default. To upload each snapshot to Cloudflare R2, configure an
+`rclone` remote and set `XIANGQI_BACKUP_RCLONE_REMOTE`; the live SQLite database
+must remain on local block storage.
 
 ## Tests
 

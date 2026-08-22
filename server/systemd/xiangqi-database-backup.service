@@ -1,0 +1,24 @@
+[Unit]
+Description=Xiangqi TV SQLite online backup
+After=xiangqi-engine-api.service
+
+[Service]
+Type=oneshot
+User=xiangqi
+Group=xiangqi
+WorkingDirectory=/opt/xiangqi-api
+EnvironmentFile=/etc/xiangqi-engine-api.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/xiangqi-api/.venv/bin/python /opt/xiangqi-api/scripts/backup-database.py
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/xiangqi-api
+ReadWritePaths=/var/backups/xiangqi-api
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+

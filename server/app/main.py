@@ -15,7 +15,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .game_store import GameNotFound, GameStore
+from .game_store import AdaptivePolicy, GameNotFound, GameStore, SCHEMA_VERSION
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -45,6 +45,41 @@ ADAPTIVE_ENABLED = os.getenv("XIANGQI_ADAPTIVE_ENABLED", "1").lower() in {
 ADAPTIVE_SHADOW_MODE = os.getenv("XIANGQI_ADAPTIVE_SHADOW_MODE", "0").lower() in {
     "1", "true", "yes", "on",
 }
+ADAPTIVE_MINIMUM_PLIES = max(4, int(os.getenv("XIANGQI_ADAPTIVE_MINIMUM_PLIES", "10")))
+ADAPTIVE_PROVISIONAL_GAMES = max(
+    1, int(os.getenv("XIANGQI_ADAPTIVE_PROVISIONAL_GAMES", "10"))
+)
+ADAPTIVE_PROVISIONAL_K = max(
+    1.0, float(os.getenv("XIANGQI_ADAPTIVE_PROVISIONAL_K", "40"))
+)
+ADAPTIVE_ESTABLISHED_K = max(
+    1.0, float(os.getenv("XIANGQI_ADAPTIVE_ESTABLISHED_K", "24"))
+)
+ADAPTIVE_ADJUSTMENT_INTERVAL = max(
+    1, int(os.getenv("XIANGQI_ADAPTIVE_ADJUSTMENT_INTERVAL", "3"))
+)
+ADAPTIVE_ROLLING_WINDOW = max(
+    1, int(os.getenv("XIANGQI_ADAPTIVE_ROLLING_WINDOW", "5"))
+)
+ADAPTIVE_PROMOTE_SCORE = min(
+    1.0, max(0.5, float(os.getenv("XIANGQI_ADAPTIVE_PROMOTE_SCORE", "0.65")))
+)
+ADAPTIVE_DEMOTE_SCORE = max(
+    0.0, min(0.5, float(os.getenv("XIANGQI_ADAPTIVE_DEMOTE_SCORE", "0.35")))
+)
+ADAPTIVE_INITIAL_RATING = float(os.getenv("XIANGQI_ADAPTIVE_INITIAL_RATING", "1200"))
+ADAPTIVE_INITIAL_LEVEL = min(
+    7, max(0, int(os.getenv("XIANGQI_ADAPTIVE_INITIAL_LEVEL", "2")))
+)
+REVIEW_GOOD_MAX_CP = max(1, int(os.getenv("XIANGQI_REVIEW_GOOD_MAX_CP", "30")))
+REVIEW_INACCURACY_MAX_CP = max(
+    REVIEW_GOOD_MAX_CP + 1,
+    int(os.getenv("XIANGQI_REVIEW_INACCURACY_MAX_CP", "80")),
+)
+REVIEW_MISTAKE_MAX_CP = max(
+    REVIEW_INACCURACY_MAX_CP + 1,
+    int(os.getenv("XIANGQI_REVIEW_MISTAKE_MAX_CP", "200")),
+)
 GAME_DATABASE_PATH = Path(
     os.getenv("XIANGQI_GAME_DATABASE_PATH", "/var/lib/xiangqi-api/xiangqi.db")
 )
@@ -852,7 +887,19 @@ class PikafishEngine:
 
 
 engine = PikafishEngine()
-game_store = GameStore(GAME_DATABASE_PATH)
+ADAPTIVE_POLICY = AdaptivePolicy(
+    minimum_plies=ADAPTIVE_MINIMUM_PLIES,
+    provisional_games=ADAPTIVE_PROVISIONAL_GAMES,
+    provisional_k=ADAPTIVE_PROVISIONAL_K,
+    established_k=ADAPTIVE_ESTABLISHED_K,
+    adjustment_interval=ADAPTIVE_ADJUSTMENT_INTERVAL,
+    rolling_window=ADAPTIVE_ROLLING_WINDOW,
+    promote_score=ADAPTIVE_PROMOTE_SCORE,
+    demote_score=ADAPTIVE_DEMOTE_SCORE,
+    initial_rating=ADAPTIVE_INITIAL_RATING,
+    initial_level=ADAPTIVE_INITIAL_LEVEL,
+)
+game_store = GameStore(GAME_DATABASE_PATH, ADAPTIVE_POLICY)
 
 
 def review_score(evaluation: ReviewEvaluation) -> int | None:
@@ -866,11 +913,11 @@ def review_score(evaluation: ReviewEvaluation) -> int | None:
 def classify_loss(loss_cp: int | None) -> str:
     if loss_cp is None:
         return "unknown"
-    if loss_cp < 30:
+    if loss_cp < REVIEW_GOOD_MAX_CP:
         return "good"
-    if loss_cp < 80:
+    if loss_cp < REVIEW_INACCURACY_MAX_CP:
         return "inaccuracy"
-    if loss_cp < 200:
+    if loss_cp < REVIEW_MISTAKE_MAX_CP:
         return "mistake"
     return "blunder"
 
@@ -966,6 +1013,74 @@ class PostGameAnalysisWorker:
 analysis_worker = PostGameAnalysisWorker(game_store, engine)
 
 
+class ApiMetrics:
+    def __init__(self) -> None:
+        self.started_at = time.time()
+        self.in_flight = 0
+        self.requests = 0
+        self.client_errors = 0
+        self.server_errors = 0
+        self.total_elapsed_ms = 0.0
+        self.by_operation: dict[str, dict[str, float | int]] = {}
+
+    @staticmethod
+    def operation(path: str) -> str:
+        if path.endswith("/move"):
+            return "move"
+        if path.endswith("/analyze"):
+            return "analyze"
+        if "/games" in path:
+            return "games"
+        if "/adaptive" in path:
+            return "adaptive"
+        if path.endswith("/metrics"):
+            return "metrics"
+        return "other"
+
+    def record(self, path: str, status_code: int, elapsed_ms: float) -> None:
+        self.requests += 1
+        self.total_elapsed_ms += elapsed_ms
+        if 400 <= status_code < 500:
+            self.client_errors += 1
+        elif status_code >= 500:
+            self.server_errors += 1
+        operation = self.operation(path)
+        bucket = self.by_operation.setdefault(
+            operation,
+            {"requests": 0, "errors": 0, "elapsedMs": 0.0},
+        )
+        bucket["requests"] = int(bucket["requests"]) + 1
+        bucket["elapsedMs"] = float(bucket["elapsedMs"]) + elapsed_ms
+        if status_code >= 400:
+            bucket["errors"] = int(bucket["errors"]) + 1
+
+    def snapshot(self) -> dict[str, object]:
+        operations: dict[str, object] = {}
+        for name, bucket in self.by_operation.items():
+            request_count = int(bucket["requests"])
+            operations[name] = {
+                "requests": request_count,
+                "errors": int(bucket["errors"]),
+                "averageElapsedMs": round(
+                    float(bucket["elapsedMs"]) / max(1, request_count), 1
+                ),
+            }
+        return {
+            "uptimeSeconds": round(time.time() - self.started_at, 1),
+            "inFlight": self.in_flight,
+            "requests": self.requests,
+            "clientErrors": self.client_errors,
+            "serverErrors": self.server_errors,
+            "averageElapsedMs": round(
+                self.total_elapsed_ms / max(1, self.requests), 1
+            ),
+            "operations": operations,
+        }
+
+
+api_metrics = ApiMetrics()
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await game_store.initialize()
@@ -990,6 +1105,24 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+
+@app.middleware("http")
+async def collect_api_metrics(request: Request, call_next):
+    started = time.monotonic()
+    api_metrics.in_flight += 1
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        api_metrics.in_flight -= 1
+        api_metrics.record(
+            request.url.path,
+            status_code,
+            (time.monotonic() - started) * 1000,
+        )
 
 
 def require_api_token(
@@ -1019,6 +1152,52 @@ async def health() -> dict[str, object]:
         "analysisQueue": queue_stats,
         "adaptiveEnabled": ADAPTIVE_ENABLED,
         "adaptiveShadowMode": ADAPTIVE_SHADOW_MODE,
+        "schemaVersion": SCHEMA_VERSION,
+        "engineBusy": engine.lock.locked(),
+        "interactiveWaiters": engine.interactive_waiters,
+    }
+
+
+@app.get("/v1/xiangqi/metrics")
+async def metrics(
+    _: Annotated[None, Depends(require_api_token)],
+) -> dict[str, object]:
+    del _
+    queue_stats, storage_stats = await asyncio.gather(
+        game_store.get_analysis_queue_stats(),
+        game_store.get_operational_stats(),
+    )
+    return {
+        "api": api_metrics.snapshot(),
+        "engine": {
+            "running": bool(engine.process and engine.process.returncode is None),
+            "busy": engine.lock.locked(),
+            "interactiveWaiters": engine.interactive_waiters,
+            "threads": ENGINE_THREADS,
+            "hashMb": ENGINE_HASH_MB,
+        },
+        "analysisQueue": queue_stats,
+        "storage": storage_stats,
+        "adaptive": {
+            "enabled": ADAPTIVE_ENABLED,
+            "shadowMode": ADAPTIVE_SHADOW_MODE,
+            "minimumPlies": ADAPTIVE_POLICY.minimum_plies,
+            "provisionalGames": ADAPTIVE_POLICY.provisional_games,
+            "provisionalK": ADAPTIVE_POLICY.provisional_k,
+            "establishedK": ADAPTIVE_POLICY.established_k,
+            "adjustmentInterval": ADAPTIVE_POLICY.adjustment_interval,
+            "rollingWindow": ADAPTIVE_POLICY.rolling_window,
+            "promoteScore": ADAPTIVE_POLICY.promote_score,
+            "demoteScore": ADAPTIVE_POLICY.demote_score,
+            "initialRating": ADAPTIVE_POLICY.initial_rating,
+            "initialLevel": ADAPTIVE_POLICY.initial_level,
+        },
+        "review": {
+            "moveTimeMs": REVIEW_MOVE_TIME_MS,
+            "goodMaxCp": REVIEW_GOOD_MAX_CP,
+            "inaccuracyMaxCp": REVIEW_INACCURACY_MAX_CP,
+            "mistakeMaxCp": REVIEW_MISTAKE_MAX_CP,
+        },
     }
 
 
