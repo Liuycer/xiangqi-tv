@@ -5,6 +5,7 @@ import {
   evaluateBoard,
   findBestMove,
   getLocalFallbackDifficulty,
+  shouldHumanizeCloudAi,
   shouldUseCloudAi,
 } from './ai-engine'
 import { INITIAL_BOARD } from '../game/board'
@@ -78,6 +79,10 @@ describe('AiEngine', () => {
     expect(shouldUseCloudAi('normal')).toBe(true)
     expect(shouldUseCloudAi('hard')).toBe(true)
     expect(shouldUseCloudAi('custom')).toBe(true)
+    expect(shouldHumanizeCloudAi('easy')).toBe(false)
+    expect(shouldHumanizeCloudAi('normal')).toBe(true)
+    expect(shouldHumanizeCloudAi('hard')).toBe(false)
+    expect(shouldHumanizeCloudAi('custom')).toBe(false)
   })
 
   it('uses quiescence search to avoid a poisoned capture at the horizon', () => {

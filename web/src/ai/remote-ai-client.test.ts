@@ -108,6 +108,54 @@ describe('remote AI client', () => {
     })).toBe('g3g4')
   })
 
+  it('requests humanized candidate selection only when enabled', async () => {
+    const redMove: Move = {
+      pieceId: 'red-soldier-3',
+      from: { row: 6, col: 6 },
+      to: { row: 5, col: 6 },
+      capturedPiece: null,
+    }
+    const currentBoard = applyMove(INITIAL_BOARD, redMove)
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      bestmove: 'c6c5',
+      score: 20,
+      depth: 3,
+      nodes: 1200,
+      elapsedMs: 4,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    const client = new RemoteAiClient({
+      apiUrl: 'https://example.test',
+      apiToken: 'a'.repeat(64),
+    })
+
+    await client.findMove({
+      initialBoard: INITIAL_BOARD,
+      board: currentBoard,
+      player: 'black',
+      moves: [redMove],
+    }, 3, {
+      humanize: true,
+      variationSeed: 123456,
+      openingPreference: 2,
+      avoidOpeningMove: 'b7e7',
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://example.test/v1/xiangqi/move',
+      expect.objectContaining({
+        body: JSON.stringify({
+          fen: boardToFen(INITIAL_BOARD, 'red'),
+          moves: ['g3g4'],
+          depth: 3,
+          humanize: true,
+          variationSeed: 123456,
+          openingPreference: 2,
+          avoidOpeningMove: 'b7e7',
+        }),
+      }),
+    )
+  })
+
   it('rejects a depth outside the supported custom range', async () => {
     const client = new RemoteAiClient({
       apiUrl: 'https://example.test',

@@ -74,6 +74,13 @@ export interface RemoteAiPosition {
   readonly moves: ReadonlyArray<Move>
 }
 
+export interface RemoteMoveOptions {
+  readonly humanize?: boolean
+  readonly variationSeed?: number
+  readonly openingPreference?: number
+  readonly avoidOpeningMove?: string
+}
+
 function getDefaultConfig(): RemoteAiConfig {
   return {
     apiUrl: import.meta.env.VITE_XIANGQI_API_URL || DEFAULT_API_URL,
@@ -364,7 +371,11 @@ export class RemoteAiClient {
     }
   }
 
-  async findMove(position: RemoteAiPosition, depth: number): Promise<AiSearchResult> {
+  async findMove(
+    position: RemoteAiPosition,
+    depth: number,
+    options: RemoteMoveOptions = {},
+  ): Promise<AiSearchResult> {
     if (!this.isConfigured()) {
       throw new Error('云端 AI 尚未配置')
     }
@@ -378,6 +389,14 @@ export class RemoteAiClient {
         fen: boardToFen(position.initialBoard, 'red'),
         moves: position.moves.map(moveToUci),
         depth,
+        ...(options.humanize
+          ? {
+              humanize: true,
+              variationSeed: options.variationSeed,
+              openingPreference: options.openingPreference,
+              avoidOpeningMove: options.avoidOpeningMove,
+            }
+          : {}),
       },
       '云端 AI',
     ))

@@ -47,6 +47,10 @@ export function shouldUseCloudAi(difficulty: AiDifficulty): boolean {
   return difficulty !== 'easy'
 }
 
+export function shouldHumanizeCloudAi(difficulty: AiDifficulty): boolean {
+  return difficulty === 'normal'
+}
+
 type TranspositionBound = 'exact' | 'lower' | 'upper'
 
 interface TranspositionEntry {

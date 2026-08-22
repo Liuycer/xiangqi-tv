@@ -5,13 +5,19 @@ import { AiClient } from '../ai/ai-client'
 import {
   AI_DIFFICULTY_OPTIONS,
   getLocalFallbackDifficulty,
+  shouldHumanizeCloudAi,
   shouldUseCloudAi,
 } from '../ai/ai-engine'
 import {
   getAnalysisPreset,
   type AnalysisPresetKey,
 } from '../ai/analysis-presentation'
-import { RemoteAiClient } from '../ai/remote-ai-client'
+import { RemoteAiClient, moveToUci } from '../ai/remote-ai-client'
+import {
+  advanceOpeningPreference,
+  loadPreviousOpeningMove,
+  savePreviousOpeningMove,
+} from '../ai/opening-variation'
 import type { PositionAnalysisResult } from '../ai/analysis-types'
 import type { AiDifficulty, AiSearchResult } from '../ai/types'
 import AnalysisPanel from '../components/AnalysisPanel.vue'
@@ -40,6 +46,13 @@ const customDepthOptions = Object.freeze(Array.from(
   { length: CUSTOM_DEPTH_MAX - CUSTOM_DEPTH_MIN + 1 },
   (_, index) => CUSTOM_DEPTH_MIN + index,
 ))
+
+function createGameVariationSeed(): number {
+  const values = new Uint32Array(1)
+  globalThis.crypto.getRandomValues(values)
+  return (values[0] ?? 0) & 0x7fff_ffff
+}
+
 const gameMode = ref<'local' | 'ai'>('ai')
 const aiDifficulty = ref<AiDifficulty>('normal')
 const customDepth = ref(CUSTOM_DEPTH_DEFAULT)
@@ -64,6 +77,9 @@ const analysisFocusIndex = ref(1)
 const soundController = new SoundController(experienceSettings.value.soundEnabled)
 let aiGeneration = 0
 let analysisGeneration = 0
+let gameVariationSeed = createGameVariationSeed()
+let openingPreference = advanceOpeningPreference()
+let previousOpeningMove = loadPreviousOpeningMove()
 
 const inputController = new InputController({
   selectSquare: (row, col) => {
@@ -139,6 +155,9 @@ const aiSearchSummary = computed(() => {
     return '测量中'
   }
   if (!lastAiResult.value) {
+    if (shouldUseCloudAi(aiDifficulty.value) && !remoteAiClient.isConfigured()) {
+      return '云端未配置 · 将使用本地回退'
+    }
     return aiError.value ?? '等待首回合'
   }
   const source = lastAiSource.value === 'cloud'
@@ -294,6 +313,8 @@ function undoMatch(): boolean {
 function restartMatch(): void {
   cancelAnalysisRequest(true)
   cancelAiSearch()
+  gameVariationSeed = createGameVariationSeed()
+  openingPreference = advanceOpeningPreference()
   gameController.restartGame()
   resetAiResult()
 }
@@ -301,6 +322,8 @@ function restartMatch(): void {
 function toggleGameMode(): void {
   cancelAnalysisRequest(true)
   cancelAiSearch()
+  gameVariationSeed = createGameVariationSeed()
+  openingPreference = advanceOpeningPreference()
   gameMode.value = gameMode.value === 'local' ? 'ai' : 'local'
   gameController.restartGame()
   resetAiResult()
@@ -526,7 +549,12 @@ async function requestAiMoveIfNeeded(): Promise<void> {
           board: snapshot.board,
           player: 'black',
           moves: snapshot.history,
-        }, targetAiDepth.value)
+        }, targetAiDepth.value, {
+          humanize: shouldHumanizeCloudAi(aiDifficulty.value),
+          variationSeed: gameVariationSeed,
+          openingPreference,
+          avoidOpeningMove: previousOpeningMove ?? undefined,
+        })
         source = 'cloud'
       } catch {
         if (generation !== aiGeneration || gameMode.value !== 'ai') {
@@ -554,6 +582,15 @@ async function requestAiMoveIfNeeded(): Promise<void> {
     lastAiResult.value = result
     lastAiSource.value = source
     lastAiFallback.value = usedFallback
+    if (
+      result.move
+      && source === 'cloud'
+      && aiDifficulty.value === 'normal'
+      && snapshot.history.length === 1
+    ) {
+      previousOpeningMove = moveToUci(result.move)
+      savePreviousOpeningMove(previousOpeningMove)
+    }
     if (result.move) {
       gameController.playMove(result.move)
     }

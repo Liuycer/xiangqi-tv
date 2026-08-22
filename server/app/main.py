@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import os
+import random
 import re
 import time
 from contextlib import asynccontextmanager, suppress
@@ -13,6 +15,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+
+logger = logging.getLogger("uvicorn.error")
 
 ENGINE_PATH = Path(
     os.getenv("XIANGQI_ENGINE_PATH", "/opt/xiangqi-engine/bin/pikafish")
@@ -30,6 +34,15 @@ MAX_ANALYSIS_MULTIPV = min(
 SEARCH_TIMEOUT_SECONDS = max(
     5, int(os.getenv("XIANGQI_SEARCH_TIMEOUT_SECONDS", "30"))
 )
+HUMANIZED_MULTIPV = 3
+HUMANIZED_EARLY_OPENING_MAX_MOVE_COUNT = 5
+HUMANIZED_EARLY_OPENING_MAX_SCORE_LOSS = 30
+HUMANIZED_EARLY_OPENING_RANK_WEIGHTS = {1: 45, 2: 35, 3: 20}
+HUMANIZED_OPENING_MAX_MOVE_COUNT = 11
+HUMANIZED_OPENING_MAX_SCORE_LOSS = 20
+HUMANIZED_OPENING_RANK_WEIGHTS = {1: 60, 2: 30, 3: 10}
+HUMANIZED_REGULAR_MAX_SCORE_LOSS = 12
+HUMANIZED_REGULAR_RANK_WEIGHTS = {1: 75, 2: 20, 3: 5}
 API_TOKEN = os.getenv("XIANGQI_API_TOKEN", "")
 ALLOWED_ORIGINS = tuple(
     origin.strip()
@@ -119,6 +132,10 @@ class PositionRequest(BaseModel):
 class MoveRequest(PositionRequest):
     depth: int | None = Field(default=None, ge=2)
     moveTimeMs: int | None = Field(default=None, ge=100)
+    humanize: bool = False
+    variationSeed: int | None = Field(default=None, ge=0, le=2_147_483_647)
+    openingPreference: int | None = Field(default=None, ge=1, le=3)
+    avoidOpeningMove: str | None = Field(default=None, pattern=r"^[a-i][0-9][a-i][0-9]$")
 
     @field_validator("moveTimeMs")
     @classmethod
@@ -138,6 +155,14 @@ class MoveRequest(PositionRequest):
     def has_one_search_limit(self) -> "MoveRequest":
         if (self.depth is None) == (self.moveTimeMs is None):
             raise ValueError("depth 和 moveTimeMs 必须且只能提供一个")
+        if self.humanize and self.depth != 3:
+            raise ValueError("拟人化候选选择只允许用于普通 D3")
+        if self.variationSeed is not None and not self.humanize:
+            raise ValueError("variationSeed 只能用于拟人化候选选择")
+        if self.openingPreference is not None and not self.humanize:
+            raise ValueError("openingPreference 只能用于拟人化候选选择")
+        if self.avoidOpeningMove is not None and not self.humanize:
+            raise ValueError("avoidOpeningMove 只能用于拟人化候选选择")
         return self
 
 
@@ -196,6 +221,88 @@ class AnalysisResult(BaseModel):
 
 class EngineUnavailable(RuntimeError):
     pass
+
+
+def select_humanized_line(
+    lines: list[AnalysisLine],
+    random_value: float | None = None,
+    max_score_loss: int = HUMANIZED_REGULAR_MAX_SCORE_LOSS,
+    rank_weights: dict[int, int] | None = None,
+    preferred_rank: int | None = None,
+    excluded_move: str | None = None,
+) -> AnalysisLine:
+    if not lines:
+        raise EngineUnavailable("Pikafish 没有返回候选着法")
+
+    ordered = sorted(lines, key=lambda line: line.rank)
+    primary = ordered[0]
+    if primary.scoreType != "cp" or primary.scoreRed is None:
+        return primary
+
+    scored = [
+        line
+        for line in ordered[:HUMANIZED_MULTIPV]
+        if line.scoreType == "cp"
+        and line.scoreRed is not None
+    ]
+    eligible = [
+        line
+        for line in scored
+        if abs(line.scoreRed - primary.scoreRed) <= max_score_loss
+    ]
+
+    if excluded_move is not None:
+        alternatives = [line for line in eligible if line.move != excluded_move]
+        if alternatives:
+            eligible = alternatives
+        elif primary.move == excluded_move:
+            # D3 MultiPV scores fluctuate between searches. If the normal score
+            # window contains only last game's move, use the strongest other
+            # top-three line instead of repeating the exact same opening.
+            strongest_alternative = next(
+                (line for line in scored if line.move != excluded_move),
+                None,
+            )
+            if strongest_alternative is not None:
+                eligible = [strongest_alternative]
+
+    if len(eligible) <= 1:
+        return eligible[0] if eligible else primary
+
+    if preferred_rank is not None:
+        return eligible[(preferred_rank - 1) % len(eligible)]
+
+    weights_by_rank = rank_weights or HUMANIZED_REGULAR_RANK_WEIGHTS
+    weights = [weights_by_rank.get(line.rank, 0) for line in eligible]
+    total_weight = sum(weights)
+    roll = random.random() if random_value is None else random_value
+    if not 0 <= roll < 1:
+        raise ValueError("random_value 必须位于 [0, 1) 区间")
+
+    threshold = roll * total_weight
+    cumulative = 0
+    for line, weight in zip(eligible, weights, strict=True):
+        cumulative += weight
+        if threshold < cumulative:
+            return line
+    return eligible[-1]
+
+
+def get_humanized_policy(move_count: int) -> tuple[int, dict[int, int]]:
+    if move_count <= HUMANIZED_EARLY_OPENING_MAX_MOVE_COUNT:
+        return (
+            HUMANIZED_EARLY_OPENING_MAX_SCORE_LOSS,
+            HUMANIZED_EARLY_OPENING_RANK_WEIGHTS,
+        )
+    if move_count <= HUMANIZED_OPENING_MAX_MOVE_COUNT:
+        return (
+            HUMANIZED_OPENING_MAX_SCORE_LOSS,
+            HUMANIZED_OPENING_RANK_WEIGHTS,
+        )
+    return (
+        HUMANIZED_REGULAR_MAX_SCORE_LOSS,
+        HUMANIZED_REGULAR_RANK_WEIGHTS,
+    )
 
 
 class PikafishEngine:
@@ -291,7 +398,8 @@ class PikafishEngine:
     async def search(self, request: MoveRequest) -> EngineResult:
         async with self.lock:
             try:
-                await self._prepare_search(request, multi_pv=1)
+                multi_pv = HUMANIZED_MULTIPV if request.humanize else 1
+                await self._prepare_search(request, multi_pv=multi_pv)
 
                 started_at = time.monotonic()
                 if request.depth is not None:
@@ -304,10 +412,61 @@ class PikafishEngine:
                         SEARCH_TIMEOUT_SECONDS,
                         request.moveTimeMs / 1000 + 3,
                     )
-                result = await self._read_search_result(
-                    timeout=search_timeout
+                if request.humanize:
+                    side_to_move = get_side_to_move(request.fen, request.moves)
+                    lines = await self._read_analysis_result(
+                        timeout=search_timeout,
+                        multi_pv=multi_pv,
+                        side_to_move=side_to_move,
+                    )
+                    elapsed_ms = round((time.monotonic() - started_at) * 1000)
+                    await self._restore_single_pv()
+                    max_score_loss, rank_weights = get_humanized_policy(
+                        len(request.moves)
+                    )
+                    random_value = None
+                    if request.variationSeed is not None:
+                        position_seed = (
+                            f"{request.variationSeed}:{request.fen}:"
+                            + " ".join(request.moves)
+                        )
+                        random_value = random.Random(position_seed).random()
+                    selected = select_humanized_line(
+                        lines,
+                        random_value=random_value,
+                        max_score_loss=max_score_loss,
+                        rank_weights=rank_weights,
+                        preferred_rank=(
+                            request.openingPreference
+                            if len(request.moves) == 1
+                            else None
+                        ),
+                        excluded_move=(
+                            request.avoidOpeningMove
+                            if len(request.moves) == 1
+                            else None
+                        ),
+                    )
+                    score = selected.scoreRed
+                    if score is not None and side_to_move == "black":
+                        score = -score
+                    return EngineResult(
+                        bestmove=selected.move,
+                        ponder=selected.pv[1] if len(selected.pv) > 1 else None,
+                        scoreType=selected.scoreType,
+                        score=score,
+                        depth=selected.depth,
+                        seldepth=selected.seldepth,
+                        nodes=selected.nodes,
+                        nps=selected.nps,
+                        pv=selected.pv,
+                        elapsedMs=elapsed_ms,
+                    )
+
+                result = await self._read_search_result(timeout=search_timeout)
+                result["elapsedMs"] = round(
+                    (time.monotonic() - started_at) * 1000
                 )
-                result["elapsedMs"] = round((time.monotonic() - started_at) * 1000)
                 return EngineResult(**result)
             except asyncio.CancelledError:
                 await self._cancel_active_search()
@@ -531,7 +690,16 @@ async def find_move(
 ) -> EngineResult:
     del _
     try:
-        return await engine.search(request)
+        result = await engine.search(request)
+        if request.humanize:
+            logger.info(
+                "humanized move moves=%d preference=%s avoid=%s selected=%s",
+                len(request.moves),
+                request.openingPreference,
+                request.avoidOpeningMove,
+                result.bestmove,
+            )
+        return result
     except EngineUnavailable as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
