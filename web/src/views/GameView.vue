@@ -550,6 +550,7 @@ function openAnalysisPanel(): void {
   depthPickerOpen.value = false
   experienceOpen.value = false
   historyOpen.value = false
+  analysisPreset.value = 'standard'
   analysisFocusIndex.value = 1
   analysisResult.value = null
   analysisCandidateRank.value = null

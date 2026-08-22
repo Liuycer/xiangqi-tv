@@ -308,7 +308,11 @@ export class RemoteAiClient {
   private requestGeneration = 0
 
   constructor(config: RemoteAiConfig = getDefaultRemoteAiConfig()) {
-    this.config = config
+    this.config = {
+      ...config,
+      apiUrl: config.apiUrl.trim(),
+      apiToken: config.apiToken.trim(),
+    }
   }
 
   isConfigured(): boolean {
@@ -408,7 +412,7 @@ export class RemoteAiClient {
     return {
       move,
       score: remote.score ?? 0,
-      depth: remote.depth ?? 0,
+      depth: remote.depth ?? depth,
       nodes: remote.nodes ?? 0,
       quiescenceNodes: 0,
       transpositionHits: 0,

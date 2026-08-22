@@ -38,7 +38,7 @@ describe('repetition adjudicator', () => {
     const history: PositionHistoryEntry[] = [createInitialPositionEntry(BASE_BOARD, 'red')]
     const initialKey = history[0]?.key ?? ''
     for (let cycle = 0; cycle < 2; cycle += 1) {
-      history.push(entry(`response-${cycle % 1}`, 'red', false))
+      history.push(entry('response', 'red', false))
       history.push(entry(initialKey, 'black', true))
     }
 

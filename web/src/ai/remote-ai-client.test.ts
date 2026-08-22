@@ -99,6 +99,59 @@ describe('remote AI client', () => {
     )
   })
 
+  it('trims API URL and token before sending a request', async () => {
+    const token = 'a'.repeat(64)
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      bestmove: 'g3g4',
+      score: 12,
+      depth: 3,
+      nodes: 1200,
+      elapsedMs: 100,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    const client = new RemoteAiClient({
+      apiUrl: '  https://example.test/  ',
+      apiToken: `  ${token}  `,
+    })
+
+    await client.findMove({
+      initialBoard: INITIAL_BOARD,
+      board: INITIAL_BOARD,
+      player: 'red',
+      moves: [],
+    }, 3)
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://example.test/v1/xiangqi/move',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: `Bearer ${token}`,
+        }),
+      }),
+    )
+  })
+
+  it('falls back to the requested depth when the response omits depth', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      bestmove: 'g3g4',
+      score: 12,
+      nodes: 1200,
+      elapsedMs: 100,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    const client = new RemoteAiClient({
+      apiUrl: 'https://example.test',
+      apiToken: 'a'.repeat(64),
+    })
+
+    const result = await client.findMove({
+      initialBoard: INITIAL_BOARD,
+      board: INITIAL_BOARD,
+      player: 'red',
+      moves: [],
+    }, 12)
+
+    expect(result.depth).toBe(12)
+  })
+
   it('serializes move history using Pikafish UCI coordinates', () => {
     expect(moveToUci({
       pieceId: 'red-soldier-3',
