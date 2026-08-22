@@ -307,6 +307,17 @@ class GameStore:
                 (client_game_id,),
             ).fetchone()
             if existing is None:
+                connection.execute(
+                    """
+                    UPDATE games
+                    SET state = 'abandoned', result = 'abandoned',
+                        termination = 'superseded_by_new_game',
+                        updated_at = CURRENT_TIMESTAMP, ended_at = CURRENT_TIMESTAMP
+                    WHERE player_id = ? AND state = 'active'
+                      AND client_game_id <> ?
+                    """,
+                    (player_id, client_game_id),
+                )
                 game_id = str(uuid.uuid4())
                 connection.execute(
                     """
