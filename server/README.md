@@ -56,6 +56,7 @@ The systemd unit reads `/etc/xiangqi-engine-api.env`:
 ```dotenv
 XIANGQI_ENGINE_PATH=/opt/xiangqi-engine/bin/pikafish
 XIANGQI_NNUE_PATH=/opt/xiangqi-engine/bin/pikafish.nnue
+XIANGQI_GAME_DATABASE_PATH=/var/lib/xiangqi-api/xiangqi.db
 XIANGQI_ENGINE_THREADS=2
 XIANGQI_ENGINE_HASH_MB=128
 XIANGQI_MAX_MOVETIME_MS=5000
@@ -68,9 +69,10 @@ XIANGQI_API_TOKEN=replace-with-a-long-random-token
 
 Keep the API bound to localhost until an HTTPS reverse proxy is configured.
 
-The production Nginx examples in `nginx/` expose only `/health`,
-`/v1/xiangqi/move` and `/v1/xiangqi/analyze`, apply a per-IP request limit, and
-proxy to the localhost Uvicorn service. Certbot can then attach the TLS
+The production Nginx examples in `nginx/` expose `/health`, the move and
+analysis endpoints, and the authenticated `/v1/xiangqi/games` lifecycle API.
+They apply a per-IP request limit and proxy to the localhost Uvicorn service.
+Certbot can then attach the TLS
 certificate and HTTP-to-HTTPS redirect to the domain server block.
 
 ## Tests

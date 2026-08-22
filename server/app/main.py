@@ -15,6 +15,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .game_store import GameNotFound, GameStore
+
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -33,6 +35,9 @@ MAX_ANALYSIS_MULTIPV = min(
 )
 SEARCH_TIMEOUT_SECONDS = max(
     5, int(os.getenv("XIANGQI_SEARCH_TIMEOUT_SECONDS", "30"))
+)
+GAME_DATABASE_PATH = Path(
+    os.getenv("XIANGQI_GAME_DATABASE_PATH", "/var/lib/xiangqi-api/xiangqi.db")
 )
 HUMANIZED_MULTIPV = 3
 HUMANIZED_EARLY_OPENING_MAX_MOVE_COUNT = 5
@@ -217,6 +222,70 @@ class AnalysisResult(BaseModel):
     nodes: int | None = None
     nps: int | None = None
     lines: list[AnalysisLine] = Field(default_factory=list)
+
+
+class GameStartRequest(BaseModel):
+    clientGameId: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    playerId: str = Field(default="primary", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    mode: Literal["ai", "local"]
+    difficulty: Literal["easy", "normal", "hard", "custom", "adaptive", "local"]
+    aiDepth: int | None = Field(default=None, ge=2, le=MAX_DEPTH)
+    variationSeed: int | None = Field(default=None, ge=0, le=2_147_483_647)
+    initialFen: str
+
+    @field_validator("initialFen")
+    @classmethod
+    def initial_fen_is_valid(cls, value: str) -> str:
+        return validate_fen(value)
+
+
+class GameSnapshotRequest(BaseModel):
+    moves: list[str] = Field(default_factory=list, max_length=300)
+    currentPlayer: Literal["red", "black"]
+    undoCount: int = Field(default=0, ge=0, le=300)
+    fallbackUsed: bool = False
+    settingsChanged: bool = False
+
+    @field_validator("moves")
+    @classmethod
+    def moves_are_valid(cls, moves: list[str]) -> list[str]:
+        if any(not MOVE_PATTERN.fullmatch(move) for move in moves):
+            raise ValueError("走法必须使用 UCI 坐标格式，例如 h2e2")
+        return moves
+
+
+class GameFinishRequest(GameSnapshotRequest):
+    state: Literal["completed", "abandoned"]
+    result: Literal["red_win", "black_win", "draw", "abandoned"]
+    termination: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9_-]+$")
+
+    @model_validator(mode="after")
+    def result_matches_state(self) -> "GameFinishRequest":
+        if self.state == "abandoned" and self.result != "abandoned":
+            raise ValueError("未完成对局的结果必须为 abandoned")
+        if self.state == "completed" and self.result == "abandoned":
+            raise ValueError("已完成对局不能使用 abandoned 结果")
+        return self
+
+
+class StoredGame(BaseModel):
+    id: str
+    clientGameId: str
+    playerId: str
+    mode: str
+    difficulty: str
+    aiDepth: int | None = None
+    state: str
+    result: str | None = None
+    termination: str | None = None
+    currentPlayer: str
+    plyCount: int
+    undoCount: int
+    fallbackUsed: bool
+    settingsChanged: bool
+    startedAt: str
+    updatedAt: str
+    endedAt: str | None = None
 
 
 class EngineUnavailable(RuntimeError):
@@ -634,10 +703,12 @@ class PikafishEngine:
 
 
 engine = PikafishEngine()
+game_store = GameStore(GAME_DATABASE_PATH)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    await game_store.initialize()
     await engine.start()
     yield
     await engine.close()
@@ -654,7 +725,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=list(ALLOWED_ORIGINS),
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -680,7 +751,71 @@ async def health() -> dict[str, object]:
         "maxMoveTimeMs": MAX_MOVETIME_MS,
         "maxAnalysisMultiPv": MAX_ANALYSIS_MULTIPV,
         "searchTimeoutSeconds": SEARCH_TIMEOUT_SECONDS,
+        "gameStorage": "sqlite",
     }
+
+
+@app.post("/v1/xiangqi/games", response_model=StoredGame)
+async def create_game(
+    payload: GameStartRequest,
+    _: Annotated[None, Depends(require_api_token)],
+) -> StoredGame:
+    del _
+    stored = await game_store.create_game(
+        client_game_id=payload.clientGameId,
+        player_id=payload.playerId,
+        mode=payload.mode,
+        difficulty=payload.difficulty,
+        ai_depth=payload.aiDepth,
+        variation_seed=payload.variationSeed,
+        initial_fen=payload.initialFen,
+    )
+    return StoredGame(**stored)
+
+
+@app.put("/v1/xiangqi/games/{game_id}/snapshot", response_model=StoredGame)
+async def update_game_snapshot(
+    game_id: str,
+    payload: GameSnapshotRequest,
+    _: Annotated[None, Depends(require_api_token)],
+) -> StoredGame:
+    del _
+    try:
+        stored = await game_store.update_snapshot(
+            game_id,
+            moves=payload.moves,
+            current_player=payload.currentPlayer,
+            undo_count=payload.undoCount,
+            fallback_used=payload.fallbackUsed,
+            settings_changed=payload.settingsChanged,
+        )
+    except GameNotFound as error:
+        raise HTTPException(status_code=404, detail="对局不存在") from error
+    return StoredGame(**stored)
+
+
+@app.post("/v1/xiangqi/games/{game_id}/finish", response_model=StoredGame)
+async def finish_game(
+    game_id: str,
+    payload: GameFinishRequest,
+    _: Annotated[None, Depends(require_api_token)],
+) -> StoredGame:
+    del _
+    try:
+        stored = await game_store.finish_game(
+            game_id,
+            state=payload.state,
+            result=payload.result,
+            termination=payload.termination,
+            moves=payload.moves,
+            current_player=payload.currentPlayer,
+            undo_count=payload.undoCount,
+            fallback_used=payload.fallbackUsed,
+            settings_changed=payload.settingsChanged,
+        )
+    except GameNotFound as error:
+        raise HTTPException(status_code=404, detail="对局不存在") from error
+    return StoredGame(**stored)
 
 
 @app.post("/v1/xiangqi/move", response_model=EngineResult)

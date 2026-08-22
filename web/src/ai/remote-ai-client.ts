@@ -81,7 +81,7 @@ export interface RemoteMoveOptions {
   readonly avoidOpeningMove?: string
 }
 
-function getDefaultConfig(): RemoteAiConfig {
+export function getDefaultRemoteAiConfig(): RemoteAiConfig {
   return {
     apiUrl: import.meta.env.VITE_XIANGQI_API_URL || DEFAULT_API_URL,
     apiToken: import.meta.env.VITE_XIANGQI_API_TOKEN || '',
@@ -307,7 +307,7 @@ export class RemoteAiClient {
   private controller: AbortController | null = null
   private requestGeneration = 0
 
-  constructor(config: RemoteAiConfig = getDefaultConfig()) {
+  constructor(config: RemoteAiConfig = getDefaultRemoteAiConfig()) {
     this.config = config
   }
 

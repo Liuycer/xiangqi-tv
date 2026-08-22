@@ -12,7 +12,7 @@ import {
   getAnalysisPreset,
   type AnalysisPresetKey,
 } from '../ai/analysis-presentation'
-import { RemoteAiClient, moveToUci } from '../ai/remote-ai-client'
+import { RemoteAiClient, boardToFen, moveToUci } from '../ai/remote-ai-client'
 import {
   advanceOpeningPreference,
   loadPreviousOpeningMove,
@@ -27,6 +27,12 @@ import { SoundController } from '../experience/sound-controller'
 import { INITIAL_BOARD } from '../game/board'
 import { GameController, isFinished, type MoveRecord } from '../game/game-controller'
 import type { Square } from '../game/types'
+import {
+  createClientGameId,
+  GameSyncClient,
+  loadOrCreatePlayerId,
+  type GameFinishPayload,
+} from '../history/game-sync-client'
 import { InputController } from '../input/input-controller'
 
 declare global {
@@ -38,6 +44,8 @@ declare global {
 const gameController = new GameController(INITIAL_BOARD)
 const aiClient = new AiClient()
 const remoteAiClient = new RemoteAiClient()
+const gameSyncClient = new GameSyncClient()
+const playerId = loadOrCreatePlayerId()
 const CUSTOM_DEPTH_MIN = 3
 const CUSTOM_DEPTH_MAX = 20
 const CUSTOM_DEPTH_DEFAULT = 5
@@ -80,6 +88,12 @@ let analysisGeneration = 0
 let gameVariationSeed = createGameVariationSeed()
 let openingPreference = advanceOpeningPreference()
 let previousOpeningMove = loadPreviousOpeningMove()
+let currentClientGameId = createClientGameId()
+let trackedUndoCount = 0
+let trackedFallbackUsed = false
+let trackedSettingsChanged = false
+let trackingStarted = false
+let trackingFinished = false
 
 const inputController = new InputController({
   selectSquare: (row, col) => {
@@ -264,8 +278,87 @@ function syncState(): void {
       soundController.play('select')
     }
     gameState.value = nextGameState
+    if (trackingStarted && !trackingFinished && boardChanged) {
+      if (isFinished(nextGameState.status)) {
+        finishTrackedGame('completed', getTermination(nextGameState.status.phase))
+      } else {
+        queueTrackedSnapshot()
+      }
+    }
   }
   inputState.value = inputController.getSnapshot()
+}
+
+function getTrackedMoves(): ReadonlyArray<string> {
+  return gameController.getSnapshot().history.map(moveToUci)
+}
+
+function getTrackingPayload() {
+  const snapshot = gameController.getSnapshot()
+  return {
+    moves: getTrackedMoves(),
+    currentPlayer: snapshot.currentPlayer,
+    undoCount: trackedUndoCount,
+    fallbackUsed: trackedFallbackUsed,
+    settingsChanged: trackedSettingsChanged,
+  } as const
+}
+
+function getTermination(phase: string): string {
+  if (phase === 'checkmate' || phase === 'stalemate' || phase === 'perpetual-check') {
+    return phase
+  }
+  if (phase === 'repetition-draw') {
+    return 'repetition_draw'
+  }
+  return 'normal'
+}
+
+function beginTrackedGame(): void {
+  currentClientGameId = createClientGameId()
+  trackedUndoCount = 0
+  trackedFallbackUsed = false
+  trackedSettingsChanged = false
+  trackingStarted = true
+  trackingFinished = false
+  gameSyncClient.start({
+    clientGameId: currentClientGameId,
+    playerId,
+    mode: gameMode.value,
+    difficulty: gameMode.value === 'local' ? 'local' : aiDifficulty.value,
+    aiDepth: gameMode.value === 'local' ? null : targetAiDepth.value,
+    variationSeed: gameMode.value === 'ai' ? gameVariationSeed : null,
+    initialFen: boardToFen(INITIAL_BOARD, 'red'),
+  })
+}
+
+function queueTrackedSnapshot(): void {
+  if (!trackingStarted || trackingFinished) {
+    return
+  }
+  gameSyncClient.snapshot(currentClientGameId, getTrackingPayload())
+}
+
+function finishTrackedGame(
+  state: GameFinishPayload['state'],
+  termination: string,
+): void {
+  if (!trackingStarted || trackingFinished) {
+    return
+  }
+  const snapshot = gameController.getSnapshot()
+  const result: GameFinishPayload['result'] = state === 'abandoned'
+    ? 'abandoned'
+    : snapshot.status.winner === 'red'
+      ? 'red_win'
+      : snapshot.status.winner === 'black' ? 'black_win' : 'draw'
+  trackingFinished = true
+  gameSyncClient.finish(currentClientGameId, {
+    ...getTrackingPayload(),
+    state,
+    result,
+    termination,
+  })
 }
 
 function cancelAiSearch(): void {
@@ -306,6 +399,9 @@ function undoMatch(): boolean {
   if (changed && undoTwice) {
     gameController.undoMove()
   }
+  if (changed) {
+    trackedUndoCount += 1
+  }
   resetAiResult()
   return changed
 }
@@ -313,20 +409,24 @@ function undoMatch(): boolean {
 function restartMatch(): void {
   cancelAnalysisRequest(true)
   cancelAiSearch()
+  finishTrackedGame('abandoned', 'restart')
   gameVariationSeed = createGameVariationSeed()
   openingPreference = advanceOpeningPreference()
   gameController.restartGame()
   resetAiResult()
+  beginTrackedGame()
 }
 
 function toggleGameMode(): void {
   cancelAnalysisRequest(true)
   cancelAiSearch()
+  finishTrackedGame('abandoned', 'mode_change')
   gameVariationSeed = createGameVariationSeed()
   openingPreference = advanceOpeningPreference()
   gameMode.value = gameMode.value === 'local' ? 'ai' : 'local'
   gameController.restartGame()
   resetAiResult()
+  beginTrackedGame()
 }
 
 function cycleAiDifficulty(): void {
@@ -335,6 +435,10 @@ function cycleAiDifficulty(): void {
   const order: ReadonlyArray<AiDifficulty> = ['easy', 'normal', 'hard', 'custom']
   const currentIndex = order.indexOf(aiDifficulty.value)
   aiDifficulty.value = order[(currentIndex + 1) % order.length] ?? 'normal'
+  if (gameController.getSnapshot().history.length > 0) {
+    trackedSettingsChanged = true
+    queueTrackedSnapshot()
+  }
   resetAiResult()
   if (aiDifficulty.value === 'custom') {
     openCustomDepthPicker()
@@ -360,6 +464,10 @@ function selectCustomDepth(depth: number): void {
   cancelAiSearch()
   aiDifficulty.value = 'custom'
   customDepth.value = depth
+  if (gameController.getSnapshot().history.length > 0) {
+    trackedSettingsChanged = true
+    queueTrackedSnapshot()
+  }
   depthPickerFocusIndex.value = depth - CUSTOM_DEPTH_MIN
   closeCustomDepthPicker()
   resetAiResult()
@@ -561,6 +669,7 @@ async function requestAiMoveIfNeeded(): Promise<void> {
           return
         }
         usedFallback = true
+        trackedFallbackUsed = true
         result = await aiClient.findMove(
           snapshot.board,
           'black',
@@ -569,6 +678,7 @@ async function requestAiMoveIfNeeded(): Promise<void> {
       }
     } else {
       usedFallback = true
+      trackedFallbackUsed = true
       result = await aiClient.findMove(
         snapshot.board,
         'black',
@@ -782,12 +892,15 @@ function handleVisibilityChange(): void {
     return
   }
 
+  void gameSyncClient.flush()
   void requestAiMoveIfNeeded()
 }
 
 onMounted(() => {
   window.addEventListener('keydown', handleKeyDown)
   document.addEventListener('visibilitychange', handleVisibilityChange)
+  beginTrackedGame()
+  void gameSyncClient.flush()
   window.__xiangqiHandleBack = () => {
     if (depthPickerOpen.value) {
       closeCustomDepthPicker()
@@ -810,6 +923,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  finishTrackedGame('abandoned', 'app_closed')
   window.removeEventListener('keydown', handleKeyDown)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
   delete window.__xiangqiHandleBack

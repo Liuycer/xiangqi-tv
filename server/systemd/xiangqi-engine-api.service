@@ -18,6 +18,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
+ReadWritePaths=/var/lib/xiangqi-api
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
