@@ -300,6 +300,19 @@ class StoredGame(BaseModel):
     endedAt: str | None = None
 
 
+class AdaptiveProfileResponse(BaseModel):
+    playerId: str
+    rating: float
+    recommendedLevel: int
+    recommendedCode: str
+    recommendedLabel: str
+    recommendedDepth: int
+    ratedGames: int
+    shadowMode: bool
+    adaptiveEnabled: bool
+    recentEvents: list[dict[str, object]] = Field(default_factory=list)
+
+
 class EngineUnavailable(RuntimeError):
     pass
 
@@ -867,6 +880,7 @@ class PostGameAnalysisWorker:
                 )
                 await asyncio.sleep(0)
             await self.store.complete_analysis_job(job_id)
+            await self.store.apply_shadow_rating(game_id)
             return True
         except asyncio.CancelledError:
             raise
@@ -949,6 +963,18 @@ async def create_game(
         initial_fen=payload.initialFen,
     )
     return StoredGame(**stored)
+
+
+@app.get("/v1/xiangqi/adaptive/profile", response_model=AdaptiveProfileResponse)
+async def get_adaptive_profile(
+    _: Annotated[None, Depends(require_api_token)],
+    playerId: str = "primary",
+) -> AdaptiveProfileResponse:
+    del _
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", playerId):
+        raise HTTPException(status_code=422, detail="playerId 格式无效")
+    profile = await game_store.get_player_profile(playerId)
+    return AdaptiveProfileResponse(**profile)
 
 
 @app.put("/v1/xiangqi/games/{game_id}/snapshot", response_model=StoredGame)

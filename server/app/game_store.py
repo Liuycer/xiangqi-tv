@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import sqlite3
 import uuid
 from pathlib import Path
@@ -111,7 +112,78 @@ class GameStore:
 
                 CREATE INDEX IF NOT EXISTS analysis_jobs_state_idx
                     ON analysis_jobs(state, updated_at);
+
+                CREATE TABLE IF NOT EXISTS adaptive_profiles (
+                    level INTEGER PRIMARY KEY CHECK (level BETWEEN 0 AND 7),
+                    code TEXT NOT NULL UNIQUE,
+                    label TEXT NOT NULL,
+                    engine_depth INTEGER NOT NULL,
+                    cloud_enabled INTEGER NOT NULL,
+                    humanize INTEGER NOT NULL,
+                    profile_rating REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS rating_events (
+                    id TEXT PRIMARY KEY,
+                    game_id TEXT NOT NULL UNIQUE REFERENCES games(id) ON DELETE CASCADE,
+                    player_id TEXT NOT NULL REFERENCES players(id),
+                    eligible INTEGER NOT NULL,
+                    exclusion_reason TEXT,
+                    ai_level INTEGER,
+                    actual_score REAL,
+                    expected_score REAL,
+                    rating_before REAL NOT NULL,
+                    rating_after REAL NOT NULL,
+                    recommendation_before INTEGER NOT NULL,
+                    recommendation_after INTEGER NOT NULL,
+                    average_loss_cp REAL,
+                    blunder_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 """
+            )
+            self._ensure_column(
+                connection, "players", "rating", "REAL NOT NULL DEFAULT 1200"
+            )
+            self._ensure_column(
+                connection,
+                "players",
+                "recommended_level",
+                "INTEGER NOT NULL DEFAULT 2",
+            )
+            self._ensure_column(
+                connection,
+                "players",
+                "rated_games",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                connection,
+                "games",
+                "rating_status",
+                "TEXT NOT NULL DEFAULT 'pending'",
+            )
+            self._ensure_column(connection, "games", "rating_before", "REAL")
+            self._ensure_column(connection, "games", "rating_after", "REAL")
+            self._ensure_column(connection, "games", "adaptive_level", "INTEGER")
+            profiles = (
+                (0, "A0", "初学", 2, 0, 0, 900),
+                (1, "A1", "入门", 3, 1, 1, 1050),
+                (2, "A2", "普通", 3, 1, 1, 1200),
+                (3, "A3", "进阶", 4, 1, 1, 1350),
+                (4, "A4", "业余中等", 5, 1, 0, 1500),
+                (5, "A5", "业余较强", 7, 1, 0, 1650),
+                (6, "A6", "高水平", 9, 1, 0, 1800),
+                (7, "A7", "高级挑战", 11, 1, 0, 1950),
+            )
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO adaptive_profiles(
+                    level, code, label, engine_depth, cloud_enabled,
+                    humanize, profile_rating
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                profiles,
             )
             connection.execute(
                 """
@@ -120,6 +192,20 @@ class GameStore:
                 WHERE state = 'running'
                 """
             )
+
+    @staticmethod
+    def _ensure_column(
+        connection: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     async def create_game(
         self,
@@ -449,6 +535,230 @@ class GameStore:
                 "completed": counts.get("completed", 0),
                 "failed": counts.get("failed", 0),
             }
+
+    @staticmethod
+    def _level_for_game(game: sqlite3.Row) -> int:
+        if game["adaptive_level"] is not None:
+            return max(0, min(7, int(game["adaptive_level"])))
+        difficulty = str(game["difficulty"])
+        if difficulty == "easy":
+            return 0
+        if difficulty == "normal":
+            return 2
+        if difficulty == "hard":
+            return 4
+        depth = int(game["ai_depth"] or 3)
+        if depth <= 2:
+            return 0
+        if depth <= 3:
+            return 2
+        if depth <= 4:
+            return 3
+        if depth <= 5:
+            return 4
+        if depth <= 7:
+            return 5
+        if depth <= 9:
+            return 6
+        return 7
+
+    async def apply_shadow_rating(self, game_id: str) -> dict[str, Any]:
+        async with self.lock:
+            return await asyncio.to_thread(self._apply_shadow_rating_sync, game_id)
+
+    def _apply_shadow_rating_sync(self, game_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            game = connection.execute(
+                "SELECT * FROM games WHERE id = ?",
+                (game_id,),
+            ).fetchone()
+            if game is None:
+                raise GameNotFound(game_id)
+            player = connection.execute(
+                "SELECT * FROM players WHERE id = ?",
+                (game["player_id"],),
+            ).fetchone()
+            assert player is not None
+            existing = connection.execute(
+                "SELECT id FROM rating_events WHERE game_id = ?",
+                (game_id,),
+            ).fetchone()
+            if existing is not None:
+                return self._get_player_profile_sync(connection, str(player["id"]))
+
+            analysis_job = connection.execute(
+                "SELECT state FROM analysis_jobs WHERE game_id = ?",
+                (game_id,),
+            ).fetchone()
+            analysis_summary = connection.execute(
+                """
+                SELECT AVG(loss_cp) AS average_loss,
+                       SUM(CASE WHEN classification = 'blunder' THEN 1 ELSE 0 END) AS blunders,
+                       COUNT(*) AS analyzed_moves
+                FROM move_analysis WHERE game_id = ?
+                """,
+                (game_id,),
+            ).fetchone()
+
+            exclusion_reason: str | None = None
+            if game["state"] != "completed":
+                exclusion_reason = "not_completed"
+            elif game["mode"] != "ai":
+                exclusion_reason = "local_game"
+            elif game["fallback_used"]:
+                exclusion_reason = "fallback_used"
+            elif game["settings_changed"]:
+                exclusion_reason = "settings_changed"
+            elif game["undo_count"] > 0:
+                exclusion_reason = "undo_used"
+            elif game["ply_count"] < 10:
+                exclusion_reason = "too_short"
+            elif analysis_job is None or analysis_job["state"] != "completed":
+                exclusion_reason = "analysis_incomplete"
+            elif not analysis_summary or int(analysis_summary["analyzed_moves"] or 0) == 0:
+                exclusion_reason = "analysis_missing"
+
+            rating_before = float(player["rating"])
+            rating_after = rating_before
+            recommendation_before = int(player["recommended_level"])
+            recommendation_after = recommendation_before
+            rated_games = int(player["rated_games"])
+            ai_level = self._level_for_game(game)
+            profile = connection.execute(
+                "SELECT * FROM adaptive_profiles WHERE level = ?",
+                (ai_level,),
+            ).fetchone()
+            assert profile is not None
+            actual_score: float | None = None
+            expected_score: float | None = None
+            if exclusion_reason is None:
+                actual_score = (
+                    1.0 if game["result"] == "red_win"
+                    else 0.5 if game["result"] == "draw"
+                    else 0.0
+                )
+                expected_score = 1.0 / (
+                    1.0 + math.pow(10.0, (float(profile["profile_rating"]) - rating_before) / 400.0)
+                )
+                k_factor = 40.0 if rated_games < 10 else 24.0
+                rating_after = round(rating_before + k_factor * (actual_score - expected_score), 2)
+                target = connection.execute(
+                    """
+                    SELECT level FROM adaptive_profiles
+                    ORDER BY ABS(profile_rating - ?), level
+                    LIMIT 1
+                    """,
+                    (rating_after,),
+                ).fetchone()
+                assert target is not None
+                target_level = int(target["level"])
+                if target_level > recommendation_before:
+                    recommendation_after = recommendation_before + 1
+                elif target_level < recommendation_before:
+                    recommendation_after = recommendation_before - 1
+                connection.execute(
+                    """
+                    UPDATE players
+                    SET rating = ?, recommended_level = ?, rated_games = rated_games + 1,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (rating_after, recommendation_after, player["id"]),
+                )
+
+            average_loss = (
+                float(analysis_summary["average_loss"])
+                if analysis_summary and analysis_summary["average_loss"] is not None
+                else None
+            )
+            blunder_count = int(analysis_summary["blunders"] or 0) if analysis_summary else 0
+            connection.execute(
+                """
+                INSERT INTO rating_events(
+                    id, game_id, player_id, eligible, exclusion_reason, ai_level,
+                    actual_score, expected_score, rating_before, rating_after,
+                    recommendation_before, recommendation_after,
+                    average_loss_cp, blunder_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    game_id,
+                    player["id"],
+                    int(exclusion_reason is None),
+                    exclusion_reason,
+                    ai_level,
+                    actual_score,
+                    expected_score,
+                    rating_before,
+                    rating_after,
+                    recommendation_before,
+                    recommendation_after,
+                    average_loss,
+                    blunder_count,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE games SET rating_status = ?, rating_before = ?, rating_after = ?
+                WHERE id = ?
+                """,
+                (
+                    "rated" if exclusion_reason is None else f"excluded:{exclusion_reason}",
+                    rating_before,
+                    rating_after,
+                    game_id,
+                ),
+            )
+            return self._get_player_profile_sync(connection, str(player["id"]))
+
+    async def get_player_profile(self, player_id: str) -> dict[str, Any]:
+        async with self.lock:
+            return await asyncio.to_thread(self._get_player_profile_by_id_sync, player_id)
+
+    def _get_player_profile_by_id_sync(self, player_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("INSERT OR IGNORE INTO players(id) VALUES (?)", (player_id,))
+            return self._get_player_profile_sync(connection, player_id)
+
+    def _get_player_profile_sync(
+        self,
+        connection: sqlite3.Connection,
+        player_id: str,
+    ) -> dict[str, Any]:
+        player = connection.execute(
+            "SELECT * FROM players WHERE id = ?",
+            (player_id,),
+        ).fetchone()
+        assert player is not None
+        profile = connection.execute(
+            "SELECT * FROM adaptive_profiles WHERE level = ?",
+            (player["recommended_level"],),
+        ).fetchone()
+        assert profile is not None
+        recent_rows = connection.execute(
+            """
+            SELECT eligible, exclusion_reason, rating_before, rating_after,
+                   recommendation_after, average_loss_cp, blunder_count, created_at
+            FROM rating_events
+            WHERE player_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 6
+            """,
+            (player_id,),
+        ).fetchall()
+        return {
+            "playerId": player_id,
+            "rating": float(player["rating"]),
+            "recommendedLevel": int(player["recommended_level"]),
+            "recommendedCode": profile["code"],
+            "recommendedLabel": profile["label"],
+            "recommendedDepth": int(profile["engine_depth"]),
+            "ratedGames": int(player["rated_games"]),
+            "shadowMode": True,
+            "adaptiveEnabled": False,
+            "recentEvents": [dict(row) for row in recent_rows],
+        }
 
     async def finish_game(
         self,

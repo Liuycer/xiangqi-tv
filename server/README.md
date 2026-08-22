@@ -54,6 +54,12 @@ analyzes one red move at a time with a bounded movetime, stores a checkpoint
 after every move, and yields the shared engine whenever an interactive move or
 analysis request is waiting. Interrupted jobs return to the queue on restart.
 
+After review, an idempotent shadow-rating event compares the game result with
+the internal A0–A7 opponent profile. Games with fallback search, undo, changed
+settings, fewer than ten plies, or incomplete analysis are recorded but do not
+change the rating. `GET /v1/xiangqi/adaptive/profile` exposes the recommendation
+without applying it to gameplay during shadow mode.
+
 ## Runtime configuration
 
 The systemd unit reads `/etc/xiangqi-engine-api.env`:
