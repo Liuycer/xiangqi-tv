@@ -57,4 +57,3 @@ XIANGQI_BACKUP_RETENTION_DAYS=14
 - 指标统计能读取临时数据库的玩家、对局和文件占用；
 - 在线备份脚本能产生可打开、通过 `integrity_check` 的 gzip 数据库；
 - 服务端 Python 文件语法检查通过。
-

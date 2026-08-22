@@ -1093,7 +1093,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Xiangqi TV Engine API",
-    version="0.2.0",
+    version="0.3.0",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,

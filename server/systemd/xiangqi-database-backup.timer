@@ -9,4 +9,3 @@ Unit=xiangqi-database-backup.service
 
 [Install]
 WantedBy=timers.target
-
