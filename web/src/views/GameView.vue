@@ -569,6 +569,7 @@ function closeAnalysisPanel(): void {
 }
 
 function openHistoryPanel(): void {
+  resetViewportScroll()
   gameController.cancelSelection()
   depthPickerOpen.value = false
   experienceOpen.value = false
@@ -578,6 +579,11 @@ function openHistoryPanel(): void {
   historyError.value = null
   syncState()
   void loadGameHistory()
+}
+
+function resetViewportScroll(): void {
+  window.scrollTo(0, 0)
+  window.requestAnimationFrame(() => window.scrollTo(0, 0))
 }
 
 function closeHistoryPanel(): void {
@@ -609,6 +615,7 @@ async function loadGameHistory(): Promise<void> {
       historyDetail.value = null
       historyReplayPly.value = 0
     }
+    resetViewportScroll()
   } catch (error) {
     if (generation === historyGeneration && historyOpen.value) {
       historyError.value = error instanceof Error ? error.message : '读取历史对局失败'
@@ -629,6 +636,7 @@ async function loadGameHistoryDetail(gameId: string, generation = historyGenerat
     }
     historyDetail.value = detail
     historyReplayPly.value = detail.moves.length
+    resetViewportScroll()
   } catch (error) {
     if (generation === historyGeneration && historyOpen.value) {
       historyError.value = error instanceof Error ? error.message : '读取对局详情失败'
@@ -966,7 +974,10 @@ function handleOpenAnalysis(): void {
   finishInteraction()
 }
 
-function handleOpenHistory(): void {
+function handleOpenHistory(event?: MouseEvent): void {
+  if (event?.currentTarget instanceof HTMLElement) {
+    event.currentTarget.blur()
+  }
   inputController.openHistoryFromPointer()
   hoveredSquare.value = null
   finishInteraction()
