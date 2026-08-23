@@ -10,7 +10,8 @@ from typing import Any, Literal
 
 
 GameState = Literal["active", "completed", "abandoned"]
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+MAX_ACTIVE_PROFILES = 6
 
 
 @dataclass(frozen=True)
@@ -23,12 +24,30 @@ class AdaptivePolicy:
     rolling_window: int = 5
     promote_score: float = 0.65
     demote_score: float = 0.35
-    initial_rating: float = 1200.0
-    initial_level: int = 2
+    initial_rating: float = 1050.0
+    initial_level: int = 1
 
 
 class GameNotFound(RuntimeError):
     pass
+
+
+class ProfileNotFound(RuntimeError):
+    pass
+
+
+class ProfileLimitReached(RuntimeError):
+    pass
+
+
+class ClosingConnection(sqlite3.Connection):
+    """Commit or roll back like sqlite3.Connection, then close deterministically."""
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
 
 
 class GameStore:
@@ -42,7 +61,11 @@ class GameStore:
         self.lock = asyncio.Lock()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=10)
+        connection = sqlite3.connect(
+            self.database_path,
+            timeout=10,
+            factory=ClosingConnection,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 10000")
@@ -52,8 +75,8 @@ class GameStore:
         connection.execute(
             """
             INSERT OR IGNORE INTO players(
-                id, rating, recommended_level, current_level
-            ) VALUES (?, ?, ?, ?)
+                id, rating, recommended_level, current_level, last_active_at
+            ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
             (
                 player_id,
@@ -62,6 +85,10 @@ class GameStore:
                 self.adaptive_policy.initial_level,
             ),
         )
+
+    @staticmethod
+    def _profile_id() -> str:
+        return f"profile_{uuid.uuid4().hex}"
 
     async def initialize(self) -> None:
         async with self.lock:
@@ -206,6 +233,37 @@ class GameStore:
                 "INTEGER NOT NULL DEFAULT 0",
             )
             self._ensure_column(connection, "players", "locked_level", "INTEGER")
+            self._ensure_column(connection, "players", "device_id", "TEXT")
+            self._ensure_column(
+                connection,
+                "players",
+                "display_name",
+                "TEXT NOT NULL DEFAULT '默认棋手'",
+            )
+            self._ensure_column(
+                connection,
+                "players",
+                "avatar_key",
+                "TEXT NOT NULL DEFAULT 'general-red'",
+            )
+            self._ensure_column(connection, "players", "archived_at", "TEXT")
+            self._ensure_column(
+                connection,
+                "players",
+                "last_active_at",
+                "TEXT",
+            )
+            connection.execute(
+                """
+                UPDATE players
+                SET last_active_at = COALESCE(last_active_at, updated_at, created_at, CURRENT_TIMESTAMP)
+                WHERE last_active_at IS NULL
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS players_device_idx "
+                "ON players(device_id, archived_at, last_active_at DESC)"
+            )
             self._ensure_column(
                 connection,
                 "games",
@@ -248,7 +306,264 @@ class GameStore:
                 WHERE state = 'running'
                 """
             )
+            # Phase 27 removes manual level locking. Existing ratings and the
+            # current calibrated level are retained, but every profile resumes
+            # automatic adjustment after migration.
+            connection.execute(
+                "UPDATE players SET locked_level = NULL WHERE locked_level IS NOT NULL"
+            )
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    async def bootstrap_profiles(
+        self,
+        device_id: str,
+        legacy_player_id: str | None,
+    ) -> list[dict[str, Any]]:
+        async with self.lock:
+            return await asyncio.to_thread(
+                self._bootstrap_profiles_sync,
+                device_id,
+                legacy_player_id,
+            )
+
+    def _bootstrap_profiles_sync(
+        self,
+        device_id: str,
+        legacy_player_id: str | None,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            if legacy_player_id:
+                legacy = connection.execute(
+                    "SELECT * FROM players WHERE id = ?",
+                    (legacy_player_id,),
+                ).fetchone()
+                if legacy is not None and legacy["device_id"] is None:
+                    connection.execute(
+                        """
+                        UPDATE players
+                        SET device_id = ?, display_name = CASE
+                                WHEN display_name IS NULL OR display_name = ''
+                                THEN '默认棋手' ELSE display_name END,
+                            avatar_key = CASE
+                                WHEN avatar_key IS NULL OR avatar_key = ''
+                                THEN 'general-red' ELSE avatar_key END,
+                            last_active_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND device_id IS NULL
+                        """,
+                        (device_id, legacy_player_id),
+                    )
+
+            count = int(connection.execute(
+                "SELECT COUNT(*) FROM players WHERE device_id = ? AND archived_at IS NULL",
+                (device_id,),
+            ).fetchone()[0])
+            if count == 0:
+                profile_id = self._profile_id()
+                connection.execute(
+                    """
+                    INSERT INTO players(
+                        id, device_id, display_name, avatar_key, rating,
+                        recommended_level, current_level, last_active_at
+                    ) VALUES (?, ?, '默认棋手', 'general-red', ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        profile_id,
+                        device_id,
+                        self.adaptive_policy.initial_rating,
+                        self.adaptive_policy.initial_level,
+                        self.adaptive_policy.initial_level,
+                    ),
+                )
+            return self._list_profiles_sync(connection, device_id)
+
+    async def list_profiles(self, device_id: str) -> list[dict[str, Any]]:
+        async with self.lock:
+            return await asyncio.to_thread(self._list_profiles_by_device_sync, device_id)
+
+    def _list_profiles_by_device_sync(self, device_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            return self._list_profiles_sync(connection, device_id)
+
+    def _list_profiles_sync(
+        self,
+        connection: sqlite3.Connection,
+        device_id: str,
+    ) -> list[dict[str, Any]]:
+        rows = connection.execute(
+            """
+            SELECT id FROM players
+            WHERE device_id = ? AND archived_at IS NULL
+            ORDER BY last_active_at DESC, created_at, id
+            """,
+            (device_id,),
+        ).fetchall()
+        return [self._get_player_profile_sync(connection, str(row["id"])) for row in rows]
+
+    async def create_profile(
+        self,
+        device_id: str,
+        display_name: str,
+        avatar_key: str,
+    ) -> dict[str, Any]:
+        async with self.lock:
+            return await asyncio.to_thread(
+                self._create_profile_sync,
+                device_id,
+                display_name,
+                avatar_key,
+            )
+
+    def _create_profile_sync(
+        self,
+        device_id: str,
+        display_name: str,
+        avatar_key: str,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            count = int(connection.execute(
+                "SELECT COUNT(*) FROM players WHERE device_id = ? AND archived_at IS NULL",
+                (device_id,),
+            ).fetchone()[0])
+            if count >= MAX_ACTIVE_PROFILES:
+                raise ProfileLimitReached(device_id)
+            profile_id = self._profile_id()
+            connection.execute(
+                """
+                INSERT INTO players(
+                    id, device_id, display_name, avatar_key, rating,
+                    recommended_level, current_level, last_active_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    profile_id,
+                    device_id,
+                    display_name,
+                    avatar_key,
+                    self.adaptive_policy.initial_rating,
+                    self.adaptive_policy.initial_level,
+                    self.adaptive_policy.initial_level,
+                ),
+            )
+            return self._get_player_profile_sync(connection, profile_id)
+
+    def _owned_profile(
+        self,
+        connection: sqlite3.Connection,
+        device_id: str,
+        profile_id: str,
+        *,
+        include_archived: bool = False,
+    ) -> sqlite3.Row:
+        archived_clause = "" if include_archived else " AND archived_at IS NULL"
+        row = connection.execute(
+            f"SELECT * FROM players WHERE id = ? AND device_id = ?{archived_clause}",
+            (profile_id, device_id),
+        ).fetchone()
+        if row is None:
+            raise ProfileNotFound(profile_id)
+        return row
+
+    async def update_profile(
+        self,
+        device_id: str,
+        profile_id: str,
+        display_name: str | None,
+        avatar_key: str | None,
+    ) -> dict[str, Any]:
+        async with self.lock:
+            return await asyncio.to_thread(
+                self._update_profile_sync,
+                device_id,
+                profile_id,
+                display_name,
+                avatar_key,
+            )
+
+    def _update_profile_sync(
+        self,
+        device_id: str,
+        profile_id: str,
+        display_name: str | None,
+        avatar_key: str | None,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            self._owned_profile(connection, device_id, profile_id)
+            connection.execute(
+                """
+                UPDATE players SET
+                    display_name = COALESCE(?, display_name),
+                    avatar_key = COALESCE(?, avatar_key),
+                    last_active_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (display_name, avatar_key, profile_id),
+            )
+            return self._get_player_profile_sync(connection, profile_id)
+
+    async def archive_profile(self, device_id: str, profile_id: str) -> None:
+        async with self.lock:
+            await asyncio.to_thread(self._archive_profile_sync, device_id, profile_id)
+
+    def _archive_profile_sync(self, device_id: str, profile_id: str) -> None:
+        with self._connect() as connection:
+            self._owned_profile(connection, device_id, profile_id)
+            count = int(connection.execute(
+                "SELECT COUNT(*) FROM players WHERE device_id = ? AND archived_at IS NULL",
+                (device_id,),
+            ).fetchone()[0])
+            if count <= 1:
+                raise ProfileLimitReached("last_profile")
+            connection.execute(
+                """
+                UPDATE players
+                SET archived_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (profile_id,),
+            )
+
+    async def assert_profile_owner(self, device_id: str, profile_id: str) -> None:
+        async with self.lock:
+            await asyncio.to_thread(self._assert_profile_owner_sync, device_id, profile_id)
+
+    def _assert_profile_owner_sync(self, device_id: str, profile_id: str) -> None:
+        with self._connect() as connection:
+            self._owned_profile(connection, device_id, profile_id)
+
+    async def assert_game_owner(
+        self,
+        device_id: str,
+        profile_id: str,
+        game_id: str,
+    ) -> None:
+        async with self.lock:
+            await asyncio.to_thread(
+                self._assert_game_owner_sync,
+                device_id,
+                profile_id,
+                game_id,
+            )
+
+    def _assert_game_owner_sync(
+        self,
+        device_id: str,
+        profile_id: str,
+        game_id: str,
+    ) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT g.id FROM games AS g
+                JOIN players AS p ON p.id = g.player_id
+                WHERE (g.id = ? OR g.client_game_id = ?)
+                  AND g.player_id = ? AND p.device_id = ?
+                """,
+                (game_id, game_id, profile_id, device_id),
+            ).fetchone()
+            if row is None:
+                raise GameNotFound(game_id)
 
     @staticmethod
     def _ensure_column(
@@ -866,6 +1181,12 @@ class GameStore:
         ).fetchall()
         return {
             "playerId": player_id,
+            "profileId": player_id,
+            "deviceId": player["device_id"],
+            "displayName": player["display_name"],
+            "avatarKey": player["avatar_key"],
+            "createdAt": player["created_at"],
+            "lastActiveAt": player["last_active_at"],
             "rating": float(player["rating"]),
             "recommendedLevel": int(player["recommended_level"]),
             "recommendedCode": recommended_profile["code"],
@@ -877,6 +1198,11 @@ class GameStore:
             "currentDepth": int(current_profile["engine_depth"]),
             "cloudEnabled": bool(current_profile["cloud_enabled"]),
             "humanize": bool(current_profile["humanize"]),
+            "humanizeStyle": (
+                "strong" if current_level == 1
+                else "moderate" if current_level == 2
+                else None
+            ),
             "locked": player["locked_level"] is not None,
             "gamesUntilAdjustment": max(
                 0,

@@ -57,8 +57,10 @@ analysis request is waiting. Interrupted jobs return to the queue on restart.
 After review, an idempotent shadow-rating event compares the game result with
 the internal A0–A7 opponent profile. Games with fallback search, undo, changed
 settings, fewer than ten plies, or incomplete analysis are recorded but do not
-change the rating. `GET /v1/xiangqi/adaptive/profile` exposes the recommendation
-without applying it to gameplay during shadow mode.
+change the rating. Phase 25–28 exposes device-owned player profiles through
+`/v1/xiangqi/profiles`; each profile has independent rating, level, games and
+review history. New profiles start at A1 / 1050 and gameplay always applies the
+active profile's adaptive level.
 
 ## Runtime configuration
 
@@ -85,8 +87,8 @@ XIANGQI_ADAPTIVE_ADJUSTMENT_INTERVAL=3
 XIANGQI_ADAPTIVE_ROLLING_WINDOW=5
 XIANGQI_ADAPTIVE_PROMOTE_SCORE=0.65
 XIANGQI_ADAPTIVE_DEMOTE_SCORE=0.35
-XIANGQI_ADAPTIVE_INITIAL_RATING=1200
-XIANGQI_ADAPTIVE_INITIAL_LEVEL=2
+XIANGQI_ADAPTIVE_INITIAL_RATING=1050
+XIANGQI_ADAPTIVE_INITIAL_LEVEL=1
 XIANGQI_REVIEW_GOOD_MAX_CP=30
 XIANGQI_REVIEW_INACCURACY_MAX_CP=80
 XIANGQI_REVIEW_MISTAKE_MAX_CP=200

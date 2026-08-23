@@ -16,8 +16,7 @@ export interface InputActions {
   undoMove(): boolean
   restartGame(): void
   toggleGameMode(): void
-  cycleAiDifficulty(): void
-  openCustomDepthPicker(): void
+  openProfiles(): void
   openExperience(): void
   openAnalysis(): void
   openHistory(): void

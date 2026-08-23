@@ -2,11 +2,15 @@ import { getDefaultRemoteAiConfig, type RemoteAiConfig } from '../ai/remote-ai-c
 
 const OUTBOX_STORAGE_KEY = 'xiangqi-tv-game-outbox-v1'
 const PLAYER_STORAGE_KEY = 'xiangqi-tv-player-id-v1'
+const DEVICE_STORAGE_KEY = 'xiangqi-tv-device-id-v1'
+const ACTIVE_PROFILE_STORAGE_KEY = 'xiangqi-tv-active-profile-v1'
+const PROFILE_CACHE_STORAGE_KEY = 'xiangqi-tv-profiles-v1'
 const REQUEST_TIMEOUT_MS = 8_000
 
 export interface GameStartPayload {
   readonly clientGameId: string
   readonly playerId: string
+  readonly deviceId: string
   readonly mode: 'ai' | 'local'
   readonly difficulty: 'easy' | 'normal' | 'hard' | 'custom' | 'adaptive' | 'local'
   readonly aiDepth: number | null
@@ -17,6 +21,12 @@ export interface GameStartPayload {
 
 export interface AdaptiveProfile {
   readonly playerId: string
+  readonly profileId: string
+  readonly deviceId: string | null
+  readonly displayName: string
+  readonly avatarKey: ProfileAvatarKey
+  readonly createdAt: string
+  readonly lastActiveAt: string
   readonly rating: number
   readonly recommendedLevel: number
   readonly recommendedCode: string
@@ -28,11 +38,25 @@ export interface AdaptiveProfile {
   readonly currentDepth: number
   readonly cloudEnabled: boolean
   readonly humanize: boolean
+  readonly humanizeStyle: 'strong' | 'moderate' | null
   readonly locked: boolean
   readonly gamesUntilAdjustment: number
   readonly ratedGames: number
   readonly shadowMode: boolean
   readonly adaptiveEnabled: boolean
+}
+
+export type ProfileAvatarKey =
+  | 'general-red'
+  | 'general-black'
+  | 'horse'
+  | 'cannon'
+  | 'rook'
+  | 'advisor'
+
+export interface ProfilePage {
+  readonly maxProfiles: number
+  readonly items: ReadonlyArray<AdaptiveProfile>
 }
 
 export interface GameHistorySummary {
@@ -84,6 +108,8 @@ export interface GameHistoryPage {
 }
 
 export interface GameSnapshotPayload {
+  readonly deviceId: string
+  readonly playerId: string
   readonly moves: ReadonlyArray<string>
   readonly currentPlayer: 'red' | 'black'
   readonly undoCount: number
@@ -152,6 +178,53 @@ export function loadOrCreatePlayerId(): string {
   }
 }
 
+export function loadOrCreateDeviceId(): string {
+  try {
+    const existing = localStorage.getItem(DEVICE_STORAGE_KEY)
+    if (existing && /^[A-Za-z0-9_-]{8,80}$/.test(existing)) {
+      return existing
+    }
+    const created = createIdentifier('device')
+    localStorage.setItem(DEVICE_STORAGE_KEY, created)
+    return created
+  } catch {
+    return createIdentifier('device')
+  }
+}
+
+export function loadActiveProfileId(): string | null {
+  try {
+    return localStorage.getItem(ACTIVE_PROFILE_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+
+export function saveActiveProfileId(profileId: string): void {
+  try {
+    localStorage.setItem(ACTIVE_PROFILE_STORAGE_KEY, profileId)
+  } catch {
+    // Profile selection still works for the current app session.
+  }
+}
+
+export function loadCachedProfiles(): ReadonlyArray<AdaptiveProfile> {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(PROFILE_CACHE_STORAGE_KEY) ?? '[]')
+    return Array.isArray(value) ? value as ReadonlyArray<AdaptiveProfile> : []
+  } catch {
+    return []
+  }
+}
+
+export function saveCachedProfiles(profiles: ReadonlyArray<AdaptiveProfile>): void {
+  try {
+    localStorage.setItem(PROFILE_CACHE_STORAGE_KEY, JSON.stringify(profiles))
+  } catch {
+    // Cached profiles are an offline convenience, never the source of truth.
+  }
+}
+
 export function createClientGameId(): string {
   return createIdentifier('game')
 }
@@ -208,10 +281,69 @@ export class GameSyncClient {
     })
   }
 
-  async getAdaptiveProfile(playerId: string): Promise<AdaptiveProfile> {
+  async getAdaptiveProfile(deviceId: string, playerId: string): Promise<AdaptiveProfile> {
     const payload = await this.requestJson(
       'GET',
-      `/v1/xiangqi/adaptive/profile?playerId=${encodeURIComponent(playerId)}`,
+      `/v1/xiangqi/adaptive/profile?deviceId=${encodeURIComponent(deviceId)}&playerId=${encodeURIComponent(playerId)}`,
+    )
+    return this.parseAdaptiveProfile(payload)
+  }
+
+  async bootstrapProfiles(deviceId: string, legacyPlayerId: string): Promise<ProfilePage> {
+    const payload = await this.requestJson('POST', '/v1/xiangqi/profiles/bootstrap', {
+      deviceId,
+      legacyPlayerId,
+    })
+    return this.parseProfilePage(payload)
+  }
+
+  async listProfiles(deviceId: string): Promise<ProfilePage> {
+    const payload = await this.requestJson(
+      'GET',
+      `/v1/xiangqi/profiles?deviceId=${encodeURIComponent(deviceId)}`,
+    )
+    return this.parseProfilePage(payload)
+  }
+
+  async createProfile(
+    deviceId: string,
+    displayName: string,
+    avatarKey: ProfileAvatarKey,
+  ): Promise<AdaptiveProfile> {
+    const payload = await this.requestJson('POST', '/v1/xiangqi/profiles', {
+      deviceId,
+      displayName,
+      avatarKey,
+    })
+    return this.parseAdaptiveProfile(payload)
+  }
+
+  async updateProfile(
+    deviceId: string,
+    profileId: string,
+    changes: { readonly displayName?: string; readonly avatarKey?: ProfileAvatarKey },
+  ): Promise<AdaptiveProfile> {
+    const payload = await this.requestJson(
+      'PATCH',
+      `/v1/xiangqi/profiles/${encodeURIComponent(profileId)}`,
+      { deviceId, ...changes },
+    )
+    return this.parseAdaptiveProfile(payload)
+  }
+
+  async archiveProfile(deviceId: string, profileId: string): Promise<void> {
+    await this.requestJson(
+      'DELETE',
+      `/v1/xiangqi/profiles/${encodeURIComponent(profileId)}`,
+      { deviceId },
+    )
+  }
+
+  async resetProfile(deviceId: string, profileId: string): Promise<AdaptiveProfile> {
+    const payload = await this.requestJson(
+      'POST',
+      `/v1/xiangqi/profiles/${encodeURIComponent(profileId)}/reset`,
+      { deviceId },
     )
     return this.parseAdaptiveProfile(payload)
   }
@@ -229,10 +361,10 @@ export class GameSyncClient {
     return this.parseAdaptiveProfile(payload)
   }
 
-  async getGameHistory(playerId: string, offset = 0): Promise<GameHistoryPage> {
+  async getGameHistory(deviceId: string, playerId: string, offset = 0): Promise<GameHistoryPage> {
     const payload = await this.requestJson(
       'GET',
-      `/v1/xiangqi/games?playerId=${encodeURIComponent(playerId)}&limit=20&offset=${offset}`,
+      `/v1/xiangqi/games?deviceId=${encodeURIComponent(deviceId)}&playerId=${encodeURIComponent(playerId)}&limit=20&offset=${offset}`,
     )
     if (typeof payload !== 'object' || payload === null || !Array.isArray((payload as GameHistoryPage).items)) {
       throw new Error('历史对局列表格式无效')
@@ -240,10 +372,10 @@ export class GameSyncClient {
     return payload as GameHistoryPage
   }
 
-  async getGameHistoryDetail(playerId: string, gameId: string): Promise<GameHistoryDetail> {
+  async getGameHistoryDetail(deviceId: string, playerId: string, gameId: string): Promise<GameHistoryDetail> {
     const payload = await this.requestJson(
       'GET',
-      `/v1/xiangqi/games/${encodeURIComponent(gameId)}?playerId=${encodeURIComponent(playerId)}`,
+      `/v1/xiangqi/games/${encodeURIComponent(gameId)}?deviceId=${encodeURIComponent(deviceId)}&playerId=${encodeURIComponent(playerId)}`,
     )
     if (typeof payload !== 'object' || payload === null || !Array.isArray((payload as GameHistoryDetail).moves)) {
       throw new Error('历史对局详情格式无效')
@@ -273,7 +405,7 @@ export class GameSyncClient {
   }
 
   private async requestJson(
-    method: 'GET' | 'POST',
+    method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
     path: string,
     body?: Record<string, unknown>,
   ): Promise<unknown> {
@@ -295,6 +427,7 @@ export class GameSyncClient {
       if (!response.ok) {
         throw new Error(`自适应服务请求失败：HTTP ${response.status}`)
       }
+      if (response.status === 204) return null
       return await response.json() as unknown
     } finally {
       globalThis.clearTimeout(timeoutId)
@@ -312,6 +445,12 @@ export class GameSyncClient {
     ] as const
     if (
       typeof source.playerId !== 'string'
+      || typeof source.profileId !== 'string'
+      || !(typeof source.deviceId === 'string' || source.deviceId === null)
+      || typeof source.displayName !== 'string'
+      || typeof source.avatarKey !== 'string'
+      || typeof source.createdAt !== 'string'
+      || typeof source.lastActiveAt !== 'string'
       || typeof source.recommendedCode !== 'string'
       || typeof source.recommendedLabel !== 'string'
       || typeof source.currentCode !== 'string'
@@ -319,6 +458,7 @@ export class GameSyncClient {
       || numberFields.some((field) => typeof source[field] !== 'number')
       || typeof source.cloudEnabled !== 'boolean'
       || typeof source.humanize !== 'boolean'
+      || !(source.humanizeStyle === 'strong' || source.humanizeStyle === 'moderate' || source.humanizeStyle === null)
       || typeof source.locked !== 'boolean'
       || typeof source.shadowMode !== 'boolean'
       || typeof source.adaptiveEnabled !== 'boolean'
@@ -326,6 +466,21 @@ export class GameSyncClient {
       throw new Error('自适应服务返回字段无效')
     }
     return source as unknown as AdaptiveProfile
+  }
+
+  private parseProfilePage(value: unknown): ProfilePage {
+    if (
+      typeof value !== 'object'
+      || value === null
+      || typeof (value as ProfilePage).maxProfiles !== 'number'
+      || !Array.isArray((value as ProfilePage).items)
+    ) {
+      throw new Error('棋手档案列表格式无效')
+    }
+    const page = value as ProfilePage
+    const items = page.items.map((item) => this.parseAdaptiveProfile(item))
+    saveCachedProfiles(items)
+    return { maxProfiles: page.maxProfiles, items }
   }
 
   private async flushOutbox(): Promise<void> {

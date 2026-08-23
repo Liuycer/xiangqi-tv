@@ -76,6 +76,7 @@ export interface RemoteAiPosition {
 
 export interface RemoteMoveOptions {
   readonly humanize?: boolean
+  readonly humanizeStyle?: 'strong' | 'moderate'
   readonly variationSeed?: number
   readonly openingPreference?: number
   readonly avoidOpeningMove?: string
@@ -396,6 +397,7 @@ export class RemoteAiClient {
         ...(options.humanize
           ? {
               humanize: true,
+              humanizeStyle: options.humanizeStyle,
               variationSeed: options.variationSeed,
               openingPreference: options.openingPreference,
               avoidOpeningMove: options.avoidOpeningMove,

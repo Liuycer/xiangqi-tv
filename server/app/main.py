@@ -11,11 +11,19 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .game_store import AdaptivePolicy, GameNotFound, GameStore, SCHEMA_VERSION
+from .game_store import (
+    MAX_ACTIVE_PROFILES,
+    AdaptivePolicy,
+    GameNotFound,
+    GameStore,
+    ProfileLimitReached,
+    ProfileNotFound,
+    SCHEMA_VERSION,
+)
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -67,9 +75,9 @@ ADAPTIVE_PROMOTE_SCORE = min(
 ADAPTIVE_DEMOTE_SCORE = max(
     0.0, min(0.5, float(os.getenv("XIANGQI_ADAPTIVE_DEMOTE_SCORE", "0.35")))
 )
-ADAPTIVE_INITIAL_RATING = float(os.getenv("XIANGQI_ADAPTIVE_INITIAL_RATING", "1200"))
+ADAPTIVE_INITIAL_RATING = float(os.getenv("XIANGQI_ADAPTIVE_INITIAL_RATING", "1050"))
 ADAPTIVE_INITIAL_LEVEL = min(
-    7, max(0, int(os.getenv("XIANGQI_ADAPTIVE_INITIAL_LEVEL", "2")))
+    7, max(0, int(os.getenv("XIANGQI_ADAPTIVE_INITIAL_LEVEL", "1")))
 )
 REVIEW_GOOD_MAX_CP = max(1, int(os.getenv("XIANGQI_REVIEW_GOOD_MAX_CP", "30")))
 REVIEW_INACCURACY_MAX_CP = max(
@@ -92,6 +100,12 @@ HUMANIZED_OPENING_MAX_SCORE_LOSS = 20
 HUMANIZED_OPENING_RANK_WEIGHTS = {1: 60, 2: 30, 3: 10}
 HUMANIZED_REGULAR_MAX_SCORE_LOSS = 12
 HUMANIZED_REGULAR_RANK_WEIGHTS = {1: 75, 2: 20, 3: 5}
+HUMANIZED_STRONG_EARLY_MAX_SCORE_LOSS = 40
+HUMANIZED_STRONG_EARLY_RANK_WEIGHTS = {1: 35, 2: 35, 3: 30}
+HUMANIZED_STRONG_OPENING_MAX_SCORE_LOSS = 30
+HUMANIZED_STRONG_OPENING_RANK_WEIGHTS = {1: 50, 2: 30, 3: 20}
+HUMANIZED_STRONG_REGULAR_MAX_SCORE_LOSS = 20
+HUMANIZED_STRONG_REGULAR_RANK_WEIGHTS = {1: 60, 2: 30, 3: 10}
 API_TOKEN = os.getenv("XIANGQI_API_TOKEN", "")
 ALLOWED_ORIGINS = tuple(
     origin.strip()
@@ -182,6 +196,7 @@ class MoveRequest(PositionRequest):
     depth: int | None = Field(default=None, ge=2)
     moveTimeMs: int | None = Field(default=None, ge=100)
     humanize: bool = False
+    humanizeStyle: Literal["strong", "moderate"] | None = None
     variationSeed: int | None = Field(default=None, ge=0, le=2_147_483_647)
     openingPreference: int | None = Field(default=None, ge=1, le=3)
     avoidOpeningMove: str | None = Field(default=None, pattern=r"^[a-i][0-9][a-i][0-9]$")
@@ -212,6 +227,8 @@ class MoveRequest(PositionRequest):
             raise ValueError("openingPreference 只能用于拟人化候选选择")
         if self.avoidOpeningMove is not None and not self.humanize:
             raise ValueError("avoidOpeningMove 只能用于拟人化候选选择")
+        if self.humanizeStyle is not None and not self.humanize:
+            raise ValueError("humanizeStyle 只能用于拟人化候选选择")
         return self
 
 
@@ -280,6 +297,7 @@ class ReviewEvaluation(BaseModel):
 class GameStartRequest(BaseModel):
     clientGameId: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
     playerId: str = Field(default="primary", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    deviceId: str | None = Field(default=None, min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
     mode: Literal["ai", "local"]
     difficulty: Literal["easy", "normal", "hard", "custom", "adaptive", "local"]
     aiDepth: int | None = Field(default=None, ge=2, le=MAX_DEPTH)
@@ -294,6 +312,8 @@ class GameStartRequest(BaseModel):
 
 
 class GameSnapshotRequest(BaseModel):
+    deviceId: str | None = Field(default=None, min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    playerId: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     moves: list[str] = Field(default_factory=list, max_length=300)
     currentPlayer: Literal["red", "black"]
     undoCount: int = Field(default=0, ge=0, le=300)
@@ -306,6 +326,12 @@ class GameSnapshotRequest(BaseModel):
         if any(not MOVE_PATTERN.fullmatch(move) for move in moves):
             raise ValueError("走法必须使用 UCI 坐标格式，例如 h2e2")
         return moves
+
+    @model_validator(mode="after")
+    def ownership_fields_are_paired(self) -> "GameSnapshotRequest":
+        if (self.deviceId is None) != (self.playerId is None):
+            raise ValueError("deviceId 和 playerId 必须同时提供")
+        return self
 
 
 class GameFinishRequest(GameSnapshotRequest):
@@ -345,6 +371,12 @@ class StoredGame(BaseModel):
 
 class AdaptiveProfileResponse(BaseModel):
     playerId: str
+    profileId: str
+    deviceId: str | None = None
+    displayName: str
+    avatarKey: str
+    createdAt: str
+    lastActiveAt: str
     rating: float
     recommendedLevel: int
     recommendedCode: str
@@ -356,6 +388,7 @@ class AdaptiveProfileResponse(BaseModel):
     currentDepth: int
     cloudEnabled: bool
     humanize: bool
+    humanizeStyle: Literal["strong", "moderate"] | None = None
     locked: bool
     gamesUntilAdjustment: int
     ratedGames: int
@@ -371,6 +404,59 @@ class AdaptiveLockRequest(BaseModel):
 
 class AdaptiveResetRequest(BaseModel):
     playerId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class ProfileBootstrapRequest(BaseModel):
+    deviceId: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    legacyPlayerId: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+
+
+class ProfileCreateRequest(BaseModel):
+    deviceId: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    displayName: str = Field(min_length=1, max_length=12)
+    avatarKey: Literal[
+        "general-red", "general-black", "horse", "cannon", "rook", "advisor"
+    ] = "general-red"
+
+    @field_validator("displayName")
+    @classmethod
+    def name_is_visible(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("棋手名称不能为空")
+        return normalized
+
+
+class ProfileUpdateRequest(BaseModel):
+    deviceId: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    displayName: str | None = Field(default=None, min_length=1, max_length=12)
+    avatarKey: Literal[
+        "general-red", "general-black", "horse", "cannon", "rook", "advisor"
+    ] | None = None
+
+    @field_validator("displayName")
+    @classmethod
+    def optional_name_is_visible(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("棋手名称不能为空")
+        return normalized
+
+
+class ProfileOwnerRequest(BaseModel):
+    deviceId: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class ProfileListResponse(BaseModel):
+    maxProfiles: int = MAX_ACTIVE_PROFILES
+    items: list[AdaptiveProfileResponse] = Field(default_factory=list)
 
 
 class GameHistorySummary(BaseModel):
@@ -490,7 +576,25 @@ def select_humanized_line(
     return eligible[-1]
 
 
-def get_humanized_policy(move_count: int) -> tuple[int, dict[int, int]]:
+def get_humanized_policy(
+    move_count: int,
+    style: Literal["strong", "moderate"] = "moderate",
+) -> tuple[int, dict[int, int]]:
+    if style == "strong":
+        if move_count <= HUMANIZED_EARLY_OPENING_MAX_MOVE_COUNT:
+            return (
+                HUMANIZED_STRONG_EARLY_MAX_SCORE_LOSS,
+                HUMANIZED_STRONG_EARLY_RANK_WEIGHTS,
+            )
+        if move_count <= HUMANIZED_OPENING_MAX_MOVE_COUNT:
+            return (
+                HUMANIZED_STRONG_OPENING_MAX_SCORE_LOSS,
+                HUMANIZED_STRONG_OPENING_RANK_WEIGHTS,
+            )
+        return (
+            HUMANIZED_STRONG_REGULAR_MAX_SCORE_LOSS,
+            HUMANIZED_STRONG_REGULAR_RANK_WEIGHTS,
+        )
     if move_count <= HUMANIZED_EARLY_OPENING_MAX_MOVE_COUNT:
         return (
             HUMANIZED_EARLY_OPENING_MAX_SCORE_LOSS,
@@ -634,7 +738,8 @@ class PikafishEngine:
                     elapsed_ms = round((time.monotonic() - started_at) * 1000)
                     await self._restore_single_pv()
                     max_score_loss, rank_weights = get_humanized_policy(
-                        len(request.moves)
+                        len(request.moves),
+                        request.humanizeStyle or "moderate",
                     )
                     random_value = None
                     if request.variationSeed is not None:
@@ -1207,6 +1312,11 @@ async def create_game(
     _: Annotated[None, Depends(require_api_token)],
 ) -> StoredGame:
     del _
+    if payload.deviceId is not None:
+        try:
+            await game_store.assert_profile_owner(payload.deviceId, payload.playerId)
+        except ProfileNotFound as error:
+            raise HTTPException(status_code=404, detail="棋手档案不存在") from error
     stored = await game_store.create_game(
         client_game_id=payload.clientGameId,
         player_id=payload.playerId,
@@ -1220,24 +1330,127 @@ async def create_game(
     return StoredGame(**stored)
 
 
+def adaptive_response(profile: dict[str, object]) -> AdaptiveProfileResponse:
+    profile["shadowMode"] = ADAPTIVE_SHADOW_MODE
+    profile["adaptiveEnabled"] = ADAPTIVE_ENABLED
+    return AdaptiveProfileResponse(**profile)
+
+
+@app.post("/v1/xiangqi/profiles/bootstrap", response_model=ProfileListResponse)
+async def bootstrap_profiles(
+    payload: ProfileBootstrapRequest,
+    _: Annotated[None, Depends(require_api_token)],
+) -> ProfileListResponse:
+    del _
+    profiles = await game_store.bootstrap_profiles(payload.deviceId, payload.legacyPlayerId)
+    return ProfileListResponse(items=[adaptive_response(profile) for profile in profiles])
+
+
+@app.get("/v1/xiangqi/profiles", response_model=ProfileListResponse)
+async def list_profiles(
+    _: Annotated[None, Depends(require_api_token)],
+    deviceId: str,
+) -> ProfileListResponse:
+    del _
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", deviceId):
+        raise HTTPException(status_code=422, detail="deviceId 格式无效")
+    profiles = await game_store.list_profiles(deviceId)
+    return ProfileListResponse(items=[adaptive_response(profile) for profile in profiles])
+
+
+@app.post("/v1/xiangqi/profiles", response_model=AdaptiveProfileResponse)
+async def create_profile(
+    payload: ProfileCreateRequest,
+    _: Annotated[None, Depends(require_api_token)],
+) -> AdaptiveProfileResponse:
+    del _
+    try:
+        profile = await game_store.create_profile(
+            payload.deviceId,
+            payload.displayName,
+            payload.avatarKey,
+        )
+    except ProfileLimitReached as error:
+        raise HTTPException(status_code=409, detail="最多只能保留 6 个棋手档案") from error
+    return adaptive_response(profile)
+
+
+@app.patch("/v1/xiangqi/profiles/{profile_id}", response_model=AdaptiveProfileResponse)
+async def update_profile(
+    profile_id: str,
+    payload: ProfileUpdateRequest,
+    _: Annotated[None, Depends(require_api_token)],
+) -> AdaptiveProfileResponse:
+    del _
+    try:
+        profile = await game_store.update_profile(
+            payload.deviceId,
+            profile_id,
+            payload.displayName,
+            payload.avatarKey,
+        )
+    except ProfileNotFound as error:
+        raise HTTPException(status_code=404, detail="棋手档案不存在") from error
+    return adaptive_response(profile)
+
+
+@app.delete("/v1/xiangqi/profiles/{profile_id}", status_code=204)
+async def archive_profile(
+    profile_id: str,
+    payload: ProfileOwnerRequest,
+    _: Annotated[None, Depends(require_api_token)],
+) -> Response:
+    del _
+    try:
+        await game_store.archive_profile(payload.deviceId, profile_id)
+    except ProfileNotFound as error:
+        raise HTTPException(status_code=404, detail="棋手档案不存在") from error
+    except ProfileLimitReached as error:
+        raise HTTPException(status_code=409, detail="至少需要保留一个棋手档案") from error
+    return Response(status_code=204)
+
+
+@app.post(
+    "/v1/xiangqi/profiles/{profile_id}/reset",
+    response_model=AdaptiveProfileResponse,
+)
+async def reset_profile(
+    profile_id: str,
+    payload: ProfileOwnerRequest,
+    _: Annotated[None, Depends(require_api_token)],
+) -> AdaptiveProfileResponse:
+    del _
+    try:
+        await game_store.assert_profile_owner(payload.deviceId, profile_id)
+    except ProfileNotFound as error:
+        raise HTTPException(status_code=404, detail="棋手档案不存在") from error
+    profile = await game_store.reset_player_rating(profile_id)
+    return adaptive_response(profile)
+
+
 @app.get("/v1/xiangqi/adaptive/profile", response_model=AdaptiveProfileResponse)
 async def get_adaptive_profile(
     _: Annotated[None, Depends(require_api_token)],
     playerId: str = "primary",
+    deviceId: str | None = None,
 ) -> AdaptiveProfileResponse:
     del _
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", playerId):
         raise HTTPException(status_code=422, detail="playerId 格式无效")
+    if deviceId is not None:
+        try:
+            await game_store.assert_profile_owner(deviceId, playerId)
+        except ProfileNotFound as error:
+            raise HTTPException(status_code=404, detail="棋手档案不存在") from error
     profile = await game_store.get_player_profile(playerId)
-    profile["shadowMode"] = ADAPTIVE_SHADOW_MODE
-    profile["adaptiveEnabled"] = ADAPTIVE_ENABLED
-    return AdaptiveProfileResponse(**profile)
+    return adaptive_response(profile)
 
 
 @app.get("/v1/xiangqi/games", response_model=GameHistoryList)
 async def list_game_history(
     _: Annotated[None, Depends(require_api_token)],
     playerId: str = "primary",
+    deviceId: str | None = None,
     limit: int = 20,
     offset: int = 0,
 ) -> GameHistoryList:
@@ -1246,6 +1459,11 @@ async def list_game_history(
         raise HTTPException(status_code=422, detail="playerId 格式无效")
     if limit < 1 or limit > 50 or offset < 0:
         raise HTTPException(status_code=422, detail="分页参数无效")
+    if deviceId is not None:
+        try:
+            await game_store.assert_profile_owner(deviceId, playerId)
+        except ProfileNotFound as error:
+            raise HTTPException(status_code=404, detail="棋手档案不存在") from error
     history = await game_store.list_games(playerId, limit=limit, offset=offset)
     return GameHistoryList(**history)
 
@@ -1255,10 +1473,16 @@ async def get_game_history_detail(
     game_id: str,
     _: Annotated[None, Depends(require_api_token)],
     playerId: str = "primary",
+    deviceId: str | None = None,
 ) -> GameHistoryDetail:
     del _
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", playerId):
         raise HTTPException(status_code=422, detail="playerId 格式无效")
+    if deviceId is not None:
+        try:
+            await game_store.assert_profile_owner(deviceId, playerId)
+        except ProfileNotFound as error:
+            raise HTTPException(status_code=404, detail="棋手档案不存在") from error
     try:
         detail = await game_store.get_game_detail(game_id, playerId)
     except GameNotFound as error:
@@ -1298,6 +1522,12 @@ async def update_game_snapshot(
 ) -> StoredGame:
     del _
     try:
+        if payload.deviceId is not None and payload.playerId is not None:
+            await game_store.assert_game_owner(
+                payload.deviceId,
+                payload.playerId,
+                game_id,
+            )
         stored = await game_store.update_snapshot(
             game_id,
             moves=payload.moves,
@@ -1319,6 +1549,12 @@ async def finish_game(
 ) -> StoredGame:
     del _
     try:
+        if payload.deviceId is not None and payload.playerId is not None:
+            await game_store.assert_game_owner(
+                payload.deviceId,
+                payload.playerId,
+                game_id,
+            )
         stored = await game_store.finish_game(
             game_id,
             state=payload.state,

@@ -10,8 +10,7 @@ function createActions(): InputActions {
     undoMove: vi.fn(() => true),
     restartGame: vi.fn(),
     toggleGameMode: vi.fn(),
-    cycleAiDifficulty: vi.fn(),
-    openCustomDepthPicker: vi.fn(),
+    openProfiles: vi.fn(),
     openExperience: vi.fn(),
     openAnalysis: vi.fn(),
     openHistory: vi.fn(),
@@ -93,11 +92,7 @@ describe('InputController', () => {
 
     controller.handleRemoteKey('ArrowRight')
     controller.handleRemoteKey('Enter')
-    expect(actions.cycleAiDifficulty).toHaveBeenCalledTimes(1)
-
-    controller.handleRemoteKey('ArrowRight')
-    controller.handleRemoteKey('Enter')
-    expect(actions.openCustomDepthPicker).toHaveBeenCalledTimes(1)
+    expect(actions.openProfiles).toHaveBeenCalledTimes(1)
 
     controller.handleRemoteKey('ArrowRight')
     controller.handleRemoteKey('Enter')
@@ -112,7 +107,7 @@ describe('InputController', () => {
     expect(actions.openHistory).toHaveBeenCalledTimes(1)
   })
 
-  it('routes the mouse analysis action to the seventh control', () => {
+  it('routes the mouse analysis action to the sixth control', () => {
     const actions = createActions()
     const controller = new InputController(actions)
 
@@ -121,12 +116,12 @@ describe('InputController', () => {
     expect(controller.getSnapshot()).toMatchObject({
       mode: 'mouse',
       area: 'actions',
-      actionIndex: 6,
+      actionIndex: 5,
     })
     expect(actions.openAnalysis).toHaveBeenCalledTimes(1)
   })
 
-  it('routes the mouse history action to the eighth control', () => {
+  it('routes the mouse history action to the seventh control', () => {
     const actions = createActions()
     const controller = new InputController(actions)
 
@@ -135,7 +130,7 @@ describe('InputController', () => {
     expect(controller.getSnapshot()).toMatchObject({
       mode: 'mouse',
       area: 'actions',
-      actionIndex: 7,
+      actionIndex: 6,
     })
     expect(actions.openHistory).toHaveBeenCalledTimes(1)
   })

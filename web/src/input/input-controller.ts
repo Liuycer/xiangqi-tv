@@ -2,7 +2,7 @@ import { BOARD_COLS, BOARD_ROWS } from '../game/board'
 import type { Square } from '../game/types'
 import type { InputActions, InputArea, InputMode, InputSnapshot } from './types'
 
-const ACTION_COUNT = 8
+const ACTION_COUNT = 7
 
 const REMOTE_MOVEMENT: Readonly<Record<string, Readonly<Square>>> = {
   ArrowUp: { row: -1, col: 0 },
@@ -86,38 +86,31 @@ export class InputController {
     this.actions.toggleGameMode()
   }
 
-  cycleDifficultyFromPointer(): void {
+  openProfilesFromPointer(): void {
     this.mode = 'mouse'
     this.area = 'actions'
     this.actionIndex = 3
-    this.actions.cycleAiDifficulty()
-  }
-
-  openCustomDepthPickerFromPointer(): void {
-    this.mode = 'mouse'
-    this.area = 'actions'
-    this.actionIndex = 4
-    this.actions.openCustomDepthPicker()
+    this.actions.openProfiles()
   }
 
   openExperienceFromPointer(): void {
     this.mode = 'mouse'
     this.area = 'actions'
-    this.actionIndex = 5
+    this.actionIndex = 4
     this.actions.openExperience()
   }
 
   openAnalysisFromPointer(): void {
     this.mode = 'mouse'
     this.area = 'actions'
-    this.actionIndex = 6
+    this.actionIndex = 5
     this.actions.openAnalysis()
   }
 
   openHistoryFromPointer(): void {
     this.mode = 'mouse'
     this.area = 'actions'
-    this.actionIndex = 7
+    this.actionIndex = 6
     this.actions.openHistory()
   }
 
@@ -167,12 +160,10 @@ export class InputController {
         } else if (this.actionIndex === 2) {
           this.actions.toggleGameMode()
         } else if (this.actionIndex === 3) {
-          this.actions.cycleAiDifficulty()
+          this.actions.openProfiles()
         } else if (this.actionIndex === 4) {
-          this.actions.openCustomDepthPicker()
-        } else if (this.actionIndex === 5) {
           this.actions.openExperience()
-        } else if (this.actionIndex === 6) {
+        } else if (this.actionIndex === 5) {
           this.actions.openAnalysis()
         } else {
           this.actions.openHistory()

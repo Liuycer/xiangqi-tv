@@ -2,12 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 import { AiClient } from '../ai/ai-client'
-import {
-  AI_DIFFICULTY_OPTIONS,
-  getLocalFallbackDifficulty,
-  shouldHumanizeCloudAi,
-  shouldUseCloudAi,
-} from '../ai/ai-engine'
+import { getLocalFallbackDifficulty } from '../ai/ai-engine'
 import {
   getAnalysisPreset,
   type AnalysisPresetKey,
@@ -19,10 +14,11 @@ import {
   savePreviousOpeningMove,
 } from '../ai/opening-variation'
 import type { PositionAnalysisResult } from '../ai/analysis-types'
-import type { AiDifficulty, AiSearchResult } from '../ai/types'
+import type { AiSearchResult } from '../ai/types'
 import AnalysisPanel from '../components/AnalysisPanel.vue'
 import ChessBoard from '../components/ChessBoard.vue'
 import HistoryPanel from '../components/HistoryPanel.vue'
+import ProfilePanel from '../components/ProfilePanel.vue'
 import { loadExperienceSettings, saveExperienceSettings } from '../experience/settings'
 import { SoundController } from '../experience/sound-controller'
 import { INITIAL_BOARD } from '../game/board'
@@ -31,11 +27,17 @@ import type { Square } from '../game/types'
 import {
   createClientGameId,
   GameSyncClient,
+  loadActiveProfileId,
+  loadCachedProfiles,
+  loadOrCreateDeviceId,
   loadOrCreatePlayerId,
+  saveActiveProfileId,
+  saveCachedProfiles,
   type AdaptiveProfile,
   type GameFinishPayload,
   type GameHistoryDetail,
   type GameHistorySummary,
+  type ProfileAvatarKey,
 } from '../history/game-sync-client'
 import { buildReplayPosition } from '../history/history-replay'
 import { InputController } from '../input/input-controller'
@@ -50,15 +52,8 @@ const gameController = new GameController(INITIAL_BOARD)
 const aiClient = new AiClient()
 const remoteAiClient = new RemoteAiClient()
 const gameSyncClient = new GameSyncClient()
-const playerId = loadOrCreatePlayerId()
-const CUSTOM_DEPTH_MIN = 3
-const CUSTOM_DEPTH_MAX = 20
-const CUSTOM_DEPTH_DEFAULT = 5
-const DEPTH_GRID_COLUMNS = 6
-const customDepthOptions = Object.freeze(Array.from(
-  { length: CUSTOM_DEPTH_MAX - CUSTOM_DEPTH_MIN + 1 },
-  (_, index) => CUSTOM_DEPTH_MIN + index,
-))
+const legacyPlayerId = loadOrCreatePlayerId()
+const deviceId = loadOrCreateDeviceId()
 
 function createGameVariationSeed(): number {
   const values = new Uint32Array(1)
@@ -67,35 +62,50 @@ function createGameVariationSeed(): number {
 }
 
 const gameMode = ref<'local' | 'ai'>('ai')
-const aiDifficulty = ref<AiDifficulty>('normal')
+const profiles = ref<ReadonlyArray<AdaptiveProfile>>(loadCachedProfiles())
+const activeProfileId = ref<string | null>(loadActiveProfileId())
+const profileOpen = ref(true)
+const profileRequired = ref(true)
+const profileLoading = ref(false)
+const profileError = ref<string | null>(null)
+const profileFocusIndex = ref(0)
+const maxProfiles = ref(6)
+const cachedActiveProfile = profiles.value.find(
+  (profile) => profile.profileId === activeProfileId.value,
+) ?? profiles.value[0]
 const adaptiveProfile = ref<AdaptiveProfile>({
-  playerId,
-  rating: 1200,
-  recommendedLevel: 2,
-  recommendedCode: 'A2',
-  recommendedLabel: '普通',
+  playerId: cachedActiveProfile?.playerId ?? legacyPlayerId,
+  profileId: cachedActiveProfile?.profileId ?? legacyPlayerId,
+  deviceId,
+  displayName: cachedActiveProfile?.displayName ?? '默认棋手',
+  avatarKey: cachedActiveProfile?.avatarKey ?? 'general-red',
+  createdAt: cachedActiveProfile?.createdAt ?? new Date().toISOString(),
+  lastActiveAt: cachedActiveProfile?.lastActiveAt ?? new Date().toISOString(),
+  rating: cachedActiveProfile?.rating ?? 1050,
+  recommendedLevel: cachedActiveProfile?.recommendedLevel ?? 1,
+  recommendedCode: cachedActiveProfile?.recommendedCode ?? 'A1',
+  recommendedLabel: cachedActiveProfile?.recommendedLabel ?? '入门',
   recommendedDepth: 3,
-  currentLevel: 2,
-  currentCode: 'A2',
-  currentLabel: '普通',
+  currentLevel: cachedActiveProfile?.currentLevel ?? 1,
+  currentCode: cachedActiveProfile?.currentCode ?? 'A1',
+  currentLabel: cachedActiveProfile?.currentLabel ?? '入门',
   currentDepth: 3,
   cloudEnabled: true,
   humanize: true,
+  humanizeStyle: 'strong',
   locked: false,
   gamesUntilAdjustment: 3,
   ratedGames: 0,
   shadowMode: false,
-  adaptiveEnabled: false,
+  adaptiveEnabled: true,
 })
+if (cachedActiveProfile) adaptiveProfile.value = cachedActiveProfile
 const adaptiveProfileError = ref<string | null>(null)
-const customDepth = ref(CUSTOM_DEPTH_DEFAULT)
 const aiThinking = ref(false)
 const aiError = ref<string | null>(null)
 const lastAiResult = ref<AiSearchResult | null>(null)
 const lastAiSource = ref<'local' | 'cloud' | null>(null)
 const lastAiFallback = ref(false)
-const depthPickerOpen = ref(false)
-const depthPickerFocusIndex = ref(CUSTOM_DEPTH_DEFAULT - CUSTOM_DEPTH_MIN)
 const experienceSettings = ref(loadExperienceSettings())
 const experienceOpen = ref(false)
 const experienceFocusIndex = ref(0)
@@ -129,6 +139,8 @@ let trackedSettingsChanged = false
 let trackingStarted = false
 let trackingFinished = false
 
+const playerId = computed(() => adaptiveProfile.value.profileId)
+
 const inputController = new InputController({
   selectSquare: (row, col) => {
     const snapshot = gameController.getSnapshot()
@@ -141,8 +153,7 @@ const inputController = new InputController({
   undoMove: () => undoMatch(),
   restartGame: () => restartMatch(),
   toggleGameMode: () => toggleGameMode(),
-  cycleAiDifficulty: () => cycleAiDifficulty(),
-  openCustomDepthPicker: () => openCustomDepthPicker(),
+  openProfiles: () => openProfilePanel(),
   openExperience: () => openExperiencePanel(),
   openAnalysis: () => openAnalysisPanel(),
   openHistory: () => openHistoryPanel(),
@@ -186,34 +197,16 @@ const analysisActionLabel = computed(() => {
   }
   return analysisConfigured.value ? 'Pikafish · 三路候选' : '云端服务未配置'
 })
-const targetAiDepth = computed(() => (
-  aiDifficulty.value === 'custom'
-    ? customDepth.value
-    : aiDifficulty.value === 'adaptive'
-      ? adaptiveProfile.value.currentDepth
-      : AI_DIFFICULTY_OPTIONS[aiDifficulty.value].maxDepth
+const targetAiDepth = computed(() => adaptiveProfile.value.currentDepth)
+const difficultyLabel = computed(() => (
+  `排位自适应 · ${adaptiveProfile.value.currentCode} D${adaptiveProfile.value.currentDepth}`
 ))
-const difficultyLabel = computed(() => {
-  if (aiDifficulty.value === 'easy') {
-    return '简单 · D2'
-  }
-  if (aiDifficulty.value === 'hard') {
-    return '困难 · D5'
-  }
-  if (aiDifficulty.value === 'custom') {
-    return `自定义 · D${customDepth.value}`
-  }
-  if (aiDifficulty.value === 'adaptive') {
-    return `自适应 · ${adaptiveProfile.value.currentCode} D${adaptiveProfile.value.currentDepth}`
-  }
-  return '普通 · D3'
-})
 const aiSearchSummary = computed(() => {
   if (aiThinking.value) {
     return '测量中'
   }
   if (!lastAiResult.value) {
-    if (shouldUseCloudAi(aiDifficulty.value) && !remoteAiClient.isConfigured()) {
+    if (adaptiveProfile.value.cloudEnabled && !remoteAiClient.isConfigured()) {
       return '云端未配置 · 将使用本地回退'
     }
     return aiError.value ?? '等待首回合'
@@ -340,6 +333,8 @@ function getTrackedMoves(): ReadonlyArray<string> {
 function getTrackingPayload() {
   const snapshot = gameController.getSnapshot()
   return {
+    deviceId,
+    playerId: playerId.value,
     moves: getTrackedMoves(),
     currentPlayer: snapshot.currentPlayer,
     undoCount: trackedUndoCount,
@@ -367,14 +362,13 @@ function beginTrackedGame(): void {
   trackingFinished = false
   gameSyncClient.start({
     clientGameId: currentClientGameId,
-    playerId,
+    playerId: playerId.value,
+    deviceId,
     mode: gameMode.value,
-    difficulty: gameMode.value === 'local' ? 'local' : aiDifficulty.value,
+    difficulty: gameMode.value === 'local' ? 'local' : 'adaptive',
     aiDepth: gameMode.value === 'local' ? null : targetAiDepth.value,
     variationSeed: gameMode.value === 'ai' ? gameVariationSeed : null,
-    adaptiveLevel: aiDifficulty.value === 'adaptive'
-      ? adaptiveProfile.value.currentLevel
-      : null,
+    adaptiveLevel: gameMode.value === 'ai' ? adaptiveProfile.value.currentLevel : null,
     initialFen: boardToFen(INITIAL_BOARD, 'red'),
   })
 }
@@ -476,58 +470,139 @@ function toggleGameMode(): void {
   beginTrackedGame()
 }
 
-function cycleAiDifficulty(): void {
-  cancelAnalysisRequest(true)
-  cancelAiSearch()
-  const order: ReadonlyArray<AiDifficulty> = ['easy', 'normal', 'hard', 'adaptive', 'custom']
-  const currentIndex = order.indexOf(aiDifficulty.value)
-  aiDifficulty.value = order[(currentIndex + 1) % order.length] ?? 'normal'
-  if (gameController.getSnapshot().history.length > 0) {
-    trackedSettingsChanged = true
-    queueTrackedSnapshot()
-  }
-  resetAiResult()
-  if (aiDifficulty.value === 'adaptive') {
-    void refreshAdaptiveProfile()
-  }
-  if (aiDifficulty.value === 'custom') {
-    openCustomDepthPicker()
-  }
-}
-
-function openCustomDepthPicker(): void {
+function openProfilePanel(): void {
   closeAnalysisPanel()
-  cancelAiSearch()
+  closeHistoryPanel()
+  experienceOpen.value = false
   gameController.cancelSelection()
-  depthPickerFocusIndex.value = customDepth.value - CUSTOM_DEPTH_MIN
-  depthPickerOpen.value = true
-}
-
-function closeCustomDepthPicker(): void {
-  depthPickerOpen.value = false
-}
-
-function selectCustomDepth(depth: number): void {
-  if (depth < CUSTOM_DEPTH_MIN || depth > CUSTOM_DEPTH_MAX) {
-    return
-  }
-  cancelAiSearch()
-  aiDifficulty.value = 'custom'
-  customDepth.value = depth
-  if (gameController.getSnapshot().history.length > 0) {
-    trackedSettingsChanged = true
-    queueTrackedSnapshot()
-  }
-  depthPickerFocusIndex.value = depth - CUSTOM_DEPTH_MIN
-  closeCustomDepthPicker()
-  resetAiResult()
-}
-
-function moveDepthPickerFocus(offset: number): void {
-  depthPickerFocusIndex.value = Math.min(
-    Math.max(depthPickerFocusIndex.value + offset, 0),
-    customDepthOptions.length - 1,
+  profileRequired.value = false
+  profileFocusIndex.value = Math.max(
+    0,
+    profiles.value.findIndex((profile) => profile.profileId === playerId.value),
   )
+  profileOpen.value = true
+}
+
+function closeProfilePanel(): void {
+  if (profileRequired.value) return
+  profileOpen.value = false
+}
+
+async function loadProfiles(): Promise<void> {
+  profileLoading.value = true
+  profileError.value = null
+  try {
+    if (!gameSyncClient.isConfigured()) {
+      if (profiles.value.length === 0) profiles.value = [adaptiveProfile.value]
+      activeProfileId.value = profiles.value.some(
+        (profile) => profile.profileId === activeProfileId.value,
+      ) ? activeProfileId.value : profiles.value[0]?.profileId ?? null
+      return
+    }
+    const page = await gameSyncClient.bootstrapProfiles(deviceId, legacyPlayerId)
+    profiles.value = page.items
+    maxProfiles.value = page.maxProfiles
+    activeProfileId.value = page.items.some(
+      (profile) => profile.profileId === activeProfileId.value,
+    ) ? activeProfileId.value : page.items[0]?.profileId ?? null
+    const active = page.items.find((profile) => profile.profileId === activeProfileId.value)
+    if (active) adaptiveProfile.value = active
+  } catch (error) {
+    profileError.value = error instanceof Error ? error.message : '棋手档案同步失败'
+    if (profiles.value.length === 0) {
+      profiles.value = [adaptiveProfile.value]
+      activeProfileId.value = adaptiveProfile.value.profileId
+    }
+  } finally {
+    profileLoading.value = false
+  }
+}
+
+function replaceProfile(profile: AdaptiveProfile): void {
+  profiles.value = profiles.value.map((item) => (
+    item.profileId === profile.profileId ? profile : item
+  ))
+  saveCachedProfiles(profiles.value)
+  if (profile.profileId === playerId.value) adaptiveProfile.value = profile
+}
+
+async function selectProfile(profileId: string): Promise<void> {
+  const selected = profiles.value.find((profile) => profile.profileId === profileId)
+  if (!selected) return
+  const switching = trackingStarted && profileId !== playerId.value
+  if (switching) {
+    cancelAnalysisRequest(true)
+    cancelAiSearch()
+    finishTrackedGame('abandoned', 'profile_switched')
+    gameController.restartGame()
+    resetAiResult()
+    gameVariationSeed = createGameVariationSeed()
+    openingPreference = advanceOpeningPreference()
+  }
+  adaptiveProfile.value = selected
+  activeProfileId.value = selected.profileId
+  saveActiveProfileId(selected.profileId)
+  profileRequired.value = false
+  profileOpen.value = false
+  if (!trackingStarted || switching) beginTrackedGame()
+  if (gameSyncClient.isConfigured()) {
+    try {
+      replaceProfile(await gameSyncClient.updateProfile(deviceId, selected.profileId, {}))
+    } catch {
+      // Touching lastActiveAt is best effort and never blocks starting a match.
+    }
+  }
+}
+
+async function createProfile(displayName: string, avatarKey: ProfileAvatarKey): Promise<void> {
+  try {
+    const created = await gameSyncClient.createProfile(deviceId, displayName, avatarKey)
+    profiles.value = [created, ...profiles.value]
+    saveCachedProfiles(profiles.value)
+    profileFocusIndex.value = 0
+    profileError.value = null
+  } catch (error) {
+    profileError.value = error instanceof Error ? error.message : '新建棋手档案失败'
+  }
+}
+
+async function updateProfile(
+  profileId: string,
+  displayName: string,
+  avatarKey: ProfileAvatarKey,
+): Promise<void> {
+  try {
+    replaceProfile(await gameSyncClient.updateProfile(deviceId, profileId, { displayName, avatarKey }))
+    profileError.value = null
+  } catch (error) {
+    profileError.value = error instanceof Error ? error.message : '保存棋手档案失败'
+  }
+}
+
+async function archiveProfile(profileId: string): Promise<void> {
+  if (profiles.value.length <= 1 || !window.confirm('确定删除这个棋手档案吗？历史对局会保留在服务器中。')) return
+  try {
+    await gameSyncClient.archiveProfile(deviceId, profileId)
+    profiles.value = profiles.value.filter((profile) => profile.profileId !== profileId)
+    saveCachedProfiles(profiles.value)
+    if (profileId === playerId.value) {
+      const replacement = profiles.value[0]
+      if (replacement) await selectProfile(replacement.profileId)
+    }
+    profileError.value = null
+  } catch (error) {
+    profileError.value = error instanceof Error ? error.message : '删除棋手档案失败'
+  }
+}
+
+async function resetProfile(profileId: string): Promise<void> {
+  if (!window.confirm('确定将该棋手的排位分和自适应等级重置为 A1 吗？')) return
+  try {
+    replaceProfile(await gameSyncClient.resetProfile(deviceId, profileId))
+    profileError.value = null
+  } catch (error) {
+    profileError.value = error instanceof Error ? error.message : '重置棋手水平失败'
+  }
 }
 
 function openExperiencePanel(): void {
@@ -547,7 +622,7 @@ function openAnalysisPanel(): void {
     return
   }
   gameController.cancelSelection()
-  depthPickerOpen.value = false
+  profileOpen.value = false
   experienceOpen.value = false
   historyOpen.value = false
   analysisPreset.value = 'standard'
@@ -572,7 +647,7 @@ function closeAnalysisPanel(): void {
 function openHistoryPanel(): void {
   resetViewportScroll()
   gameController.cancelSelection()
-  depthPickerOpen.value = false
+  profileOpen.value = false
   experienceOpen.value = false
   closeAnalysisPanel()
   historyOpen.value = true
@@ -600,7 +675,7 @@ async function loadGameHistory(): Promise<void> {
   historyError.value = null
   try {
     await gameSyncClient.flush()
-    const page = await gameSyncClient.getGameHistory(playerId)
+    const page = await gameSyncClient.getGameHistory(deviceId, playerId.value)
     if (generation !== historyGeneration || !historyOpen.value) return
     historyItems.value = page.items
     const preferred = page.items.some((item) => item.id === historySelectedGameId.value)
@@ -631,7 +706,7 @@ async function loadGameHistoryDetail(gameId: string, generation = historyGenerat
   historyDetail.value = null
   historyReplayPly.value = 0
   try {
-    const detail = await gameSyncClient.getGameHistoryDetail(playerId, gameId)
+    const detail = await gameSyncClient.getGameHistoryDetail(deviceId, playerId.value, gameId)
     if (generation !== historyGeneration || !historyOpen.value || historySelectedGameId.value !== gameId) {
       return
     }
@@ -771,9 +846,7 @@ function activateExperienceControl(): void {
   } else if (experienceFocusIndex.value === 1) {
     toggleMotion()
   } else if (experienceFocusIndex.value === 2) {
-    void toggleAdaptiveLock()
-  } else if (experienceFocusIndex.value === 3) {
-    void resetAdaptiveRating()
+    void resetProfile(playerId.value)
   } else {
     closeExperiencePanel()
   }
@@ -785,31 +858,12 @@ async function refreshAdaptiveProfile(): Promise<void> {
     return
   }
   try {
-    adaptiveProfile.value = await gameSyncClient.getAdaptiveProfile(playerId)
+    const refreshed = await gameSyncClient.getAdaptiveProfile(deviceId, playerId.value)
+    adaptiveProfile.value = refreshed
+    replaceProfile(refreshed)
     adaptiveProfileError.value = null
   } catch (error) {
     adaptiveProfileError.value = error instanceof Error ? error.message : '评级同步失败'
-  }
-}
-
-async function toggleAdaptiveLock(): Promise<void> {
-  try {
-    adaptiveProfile.value = await gameSyncClient.setAdaptiveLock(
-      playerId,
-      adaptiveProfile.value.locked ? null : adaptiveProfile.value.currentLevel,
-    )
-    adaptiveProfileError.value = null
-  } catch (error) {
-    adaptiveProfileError.value = error instanceof Error ? error.message : '锁定设置失败'
-  }
-}
-
-async function resetAdaptiveRating(): Promise<void> {
-  try {
-    adaptiveProfile.value = await gameSyncClient.resetAdaptiveProfile(playerId)
-    adaptiveProfileError.value = null
-  } catch (error) {
-    adaptiveProfileError.value = error instanceof Error ? error.message : '评级重置失败'
   }
 }
 
@@ -833,12 +887,8 @@ async function requestAiMoveIfNeeded(): Promise<void> {
     let result: AiSearchResult
     let source: 'local' | 'cloud' = 'local'
     let usedFallback = false
-    const useCloudForTurn = aiDifficulty.value === 'adaptive'
-      ? adaptiveProfile.value.cloudEnabled
-      : shouldUseCloudAi(aiDifficulty.value)
-    const humanizeTurn = aiDifficulty.value === 'adaptive'
-      ? adaptiveProfile.value.humanize
-      : shouldHumanizeCloudAi(aiDifficulty.value)
+    const useCloudForTurn = adaptiveProfile.value.cloudEnabled
+    const humanizeTurn = adaptiveProfile.value.humanize
     if (!useCloudForTurn) {
       result = await aiClient.findMove(snapshot.board, 'black', 'easy')
     } else if (remoteAiClient.isConfigured()) {
@@ -850,6 +900,7 @@ async function requestAiMoveIfNeeded(): Promise<void> {
           moves: snapshot.history,
         }, targetAiDepth.value, {
           humanize: humanizeTurn,
+          humanizeStyle: adaptiveProfile.value.humanizeStyle ?? undefined,
           variationSeed: gameVariationSeed,
           openingPreference,
           avoidOpeningMove: previousOpeningMove ?? undefined,
@@ -951,14 +1002,8 @@ function handleToggleMode(): void {
   finishInteraction()
 }
 
-function handleCycleDifficulty(): void {
-  inputController.cycleDifficultyFromPointer()
-  hoveredSquare.value = null
-  finishInteraction()
-}
-
-function handleOpenCustomDepthPicker(): void {
-  inputController.openCustomDepthPickerFromPointer()
+function handleOpenProfiles(): void {
+  inputController.openProfilesFromPointer()
   hoveredSquare.value = null
   finishInteraction()
 }
@@ -985,6 +1030,33 @@ function handleOpenHistory(event?: MouseEvent): void {
 }
 
 function handleKeyDown(event: KeyboardEvent): void {
+  if (profileOpen.value) {
+    let handled = true
+    const maximum = Math.max(0, profiles.value.length - 1)
+    if (event.key === 'ArrowLeft') {
+      profileFocusIndex.value = Math.max(0, profileFocusIndex.value - 1)
+    } else if (event.key === 'ArrowRight') {
+      profileFocusIndex.value = Math.min(maximum, profileFocusIndex.value + 1)
+    } else if (event.key === 'ArrowUp') {
+      profileFocusIndex.value = Math.max(0, profileFocusIndex.value - 2)
+    } else if (event.key === 'ArrowDown') {
+      profileFocusIndex.value = Math.min(maximum, profileFocusIndex.value + 2)
+    } else if (event.key === 'Enter') {
+      const profile = profiles.value[profileFocusIndex.value]
+      if (profile) void selectProfile(profile.profileId)
+    } else if (event.key === 'Escape' || event.key === 'Backspace') {
+      closeProfilePanel()
+    } else {
+      handled = false
+    }
+    if (handled) {
+      event.preventDefault()
+      inputController.activateRemote()
+      syncState()
+    }
+    return
+  }
+
   if (historyOpen.value) {
     let handled = true
     const itemCount = historyItems.value.length
@@ -1016,36 +1088,6 @@ function handleKeyDown(event: KeyboardEvent): void {
       }
     } else if (event.key === 'Escape' || event.key === 'Backspace') {
       closeHistoryPanel()
-    } else {
-      handled = false
-    }
-
-    if (handled) {
-      event.preventDefault()
-      hoveredSquare.value = null
-      inputController.activateRemote()
-      syncState()
-    }
-    return
-  }
-
-  if (depthPickerOpen.value) {
-    let handled = true
-    if (event.key === 'ArrowLeft') {
-      moveDepthPickerFocus(-1)
-    } else if (event.key === 'ArrowRight') {
-      moveDepthPickerFocus(1)
-    } else if (event.key === 'ArrowUp') {
-      moveDepthPickerFocus(-DEPTH_GRID_COLUMNS)
-    } else if (event.key === 'ArrowDown') {
-      moveDepthPickerFocus(DEPTH_GRID_COLUMNS)
-    } else if (event.key === 'Enter') {
-      const depth = customDepthOptions[depthPickerFocusIndex.value]
-      if (depth !== undefined) {
-        selectCustomDepth(depth)
-      }
-    } else if (event.key === 'Escape' || event.key === 'Backspace') {
-      closeCustomDepthPicker()
     } else {
       handled = false
     }
@@ -1102,7 +1144,7 @@ function handleKeyDown(event: KeyboardEvent): void {
     if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') {
       experienceFocusIndex.value = Math.max(0, experienceFocusIndex.value - 1)
     } else if (event.key === 'ArrowDown' || event.key === 'ArrowRight') {
-      experienceFocusIndex.value = Math.min(4, experienceFocusIndex.value + 1)
+      experienceFocusIndex.value = Math.min(3, experienceFocusIndex.value + 1)
     } else if (event.key === 'Enter') {
       activateExperienceControl()
     } else if (event.key === 'Escape' || event.key === 'Backspace') {
@@ -1137,23 +1179,24 @@ function handleVisibilityChange(): void {
   }
 
   void gameSyncClient.flush()
-  void refreshAdaptiveProfile()
-  void requestAiMoveIfNeeded()
+  if (trackingStarted) {
+    void refreshAdaptiveProfile()
+    void requestAiMoveIfNeeded()
+  }
 }
 
 onMounted(() => {
   window.addEventListener('keydown', handleKeyDown)
   document.addEventListener('visibilitychange', handleVisibilityChange)
-  beginTrackedGame()
   void gameSyncClient.flush()
-  void refreshAdaptiveProfile()
+  void loadProfiles()
   window.__xiangqiHandleBack = () => {
-    if (historyOpen.value) {
-      closeHistoryPanel()
+    if (profileOpen.value) {
+      closeProfilePanel()
       return true
     }
-    if (depthPickerOpen.value) {
-      closeCustomDepthPicker()
+    if (historyOpen.value) {
+      closeHistoryPanel()
       return true
     }
     if (experienceOpen.value) {
@@ -1237,11 +1280,15 @@ onBeforeUnmount(() => {
 
           <dl>
             <div>
+              <dt>当前棋手</dt>
+              <dd>{{ adaptiveProfile.displayName }}</dd>
+            </div>
+            <div>
               <dt>游戏模式</dt>
               <dd>{{ gameModeLabel }}</dd>
             </div>
             <div>
-              <dt>AI 难度</dt>
+              <dt>排位强度</dt>
               <dd>{{ gameMode === 'ai' ? difficultyLabel : '—' }}</dd>
             </div>
             <div v-if="gameMode === 'ai'">
@@ -1252,8 +1299,8 @@ onBeforeUnmount(() => {
               <dt>搜索节点</dt>
               <dd>{{ aiNodeSummary }}</dd>
             </div>
-            <div v-if="gameMode === 'ai' && aiDifficulty === 'adaptive'">
-              <dt>自适应评级</dt>
+            <div v-if="gameMode === 'ai'">
+              <dt>排位评级</dt>
               <dd>{{ Math.round(adaptiveProfile.rating) }} · {{ adaptiveProfile.currentCode }}</dd>
             </div>
             <div>
@@ -1310,28 +1357,18 @@ onBeforeUnmount(() => {
             :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 3 }"
             type="button"
             data-action-index="3"
-            @click="handleCycleDifficulty"
+            aria-haspopup="dialog"
+            :aria-expanded="profileOpen"
+            @click="handleOpenProfiles"
           >
-            <strong>AI 难度</strong>
-            <small>{{ difficultyLabel }}</small>
+            <strong>棋手档案</strong>
+            <small>{{ adaptiveProfile.displayName }} · {{ adaptiveProfile.currentCode }}</small>
           </button>
           <button
             class="action-button"
             :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 4 }"
             type="button"
             data-action-index="4"
-            aria-haspopup="dialog"
-            :aria-expanded="depthPickerOpen"
-            @click="handleOpenCustomDepthPicker"
-          >
-            <strong>自定义深度</strong>
-            <small>D{{ customDepth }} · 打开选单</small>
-          </button>
-          <button
-            class="action-button"
-            :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 5 }"
-            type="button"
-            data-action-index="5"
             @click="handleOpenExperience"
           >
             <strong>设置与棋谱</strong>
@@ -1339,9 +1376,9 @@ onBeforeUnmount(() => {
           </button>
           <button
             class="action-button"
-            :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 6 }"
+            :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 5 }"
             type="button"
-            data-action-index="6"
+            data-action-index="5"
             aria-haspopup="dialog"
             :aria-expanded="analysisOpen"
             :disabled="aiThinking || isFinished(gameState.status)"
@@ -1351,10 +1388,10 @@ onBeforeUnmount(() => {
             <small>{{ analysisActionLabel }}</small>
           </button>
           <button
-            class="action-button"
-            :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 7 }"
+            class="action-button action-button--wide"
+            :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 6 }"
             type="button"
-            data-action-index="7"
+            data-action-index="6"
             aria-haspopup="dialog"
             :aria-expanded="historyOpen"
             @click="handleOpenHistory"
@@ -1364,47 +1401,6 @@ onBeforeUnmount(() => {
           </button>
         </nav>
       </div>
-    </div>
-
-    <div
-      v-if="depthPickerOpen"
-      class="depth-picker-overlay"
-      role="presentation"
-      @click.self="closeCustomDepthPicker"
-    >
-      <section
-        class="depth-picker-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-label="选择自定义 AI 深度"
-      >
-        <header class="depth-picker-heading">
-          <div>
-            <p class="dialog-eyebrow">AI SEARCH DEPTH</p>
-            <h2>选择自定义深度</h2>
-          </div>
-          <span>D3–D20</span>
-        </header>
-        <div class="depth-picker-grid" role="listbox" aria-label="AI 搜索深度">
-          <button
-            v-for="(depth, index) in customDepthOptions"
-            :key="depth"
-            class="depth-option"
-            :class="{
-              'depth-option--selected': depth === customDepth,
-              'depth-option--focused': inputState.mode === 'remote' && index === depthPickerFocusIndex,
-            }"
-            type="button"
-            role="option"
-            :aria-selected="depth === customDepth"
-            @click="selectCustomDepth(depth)"
-          >
-            <strong>D{{ depth }}</strong>
-            <small v-if="depth === 5">默认</small>
-          </button>
-        </div>
-        <p class="depth-picker-hint">鼠标点击选择 · 方向键移动 · OK 确认 · BACK 取消</p>
-      </section>
     </div>
 
     <div
@@ -1440,24 +1436,14 @@ onBeforeUnmount(() => {
             :class="{ 'setting-control--focused': inputState.mode === 'remote' && experienceFocusIndex === 2 }"
             type="button"
             :disabled="!adaptiveProfile.adaptiveEnabled"
-            @click="toggleAdaptiveLock"
-          >
-            <span>自适应等级</span>
-            <strong>{{ adaptiveProfile.locked ? `已锁定 ${adaptiveProfile.currentCode}` : `自动 · ${adaptiveProfile.currentCode}` }}</strong>
-          </button>
-          <button
-            class="setting-control"
-            :class="{ 'setting-control--focused': inputState.mode === 'remote' && experienceFocusIndex === 3 }"
-            type="button"
-            :disabled="!adaptiveProfile.adaptiveEnabled"
-            @click="resetAdaptiveRating"
+            @click="resetProfile(playerId)"
           >
             <span>重置水平</span>
             <strong>{{ adaptiveProfile.ratedGames }} 盘</strong>
           </button>
           <button
             class="setting-control setting-control--close"
-            :class="{ 'setting-control--focused': inputState.mode === 'remote' && experienceFocusIndex === 4 }"
+            :class="{ 'setting-control--focused': inputState.mode === 'remote' && experienceFocusIndex === 3 }"
             type="button"
             @click="closeExperiencePanel"
           >
@@ -1492,6 +1478,24 @@ onBeforeUnmount(() => {
         </div>
       </section>
     </div>
+
+    <ProfilePanel
+      v-if="profileOpen"
+      :input-mode="inputState.mode"
+      :profiles="profiles"
+      :active-profile-id="activeProfileId"
+      :focus-index="profileFocusIndex"
+      :max-profiles="maxProfiles"
+      :required="profileRequired"
+      :loading="profileLoading"
+      :error="profileError"
+      @close="closeProfilePanel"
+      @select="selectProfile"
+      @create="createProfile"
+      @update="updateProfile"
+      @archive="archiveProfile"
+      @reset="resetProfile"
+    />
 
     <AnalysisPanel
       v-if="analysisOpen"
@@ -1546,22 +1550,22 @@ onBeforeUnmount(() => {
 
 .game-header {
   width: 100%;
-  margin-bottom: 1.8vh;
+  margin-bottom: 0.8vh;
   text-align: left;
 }
 
 .game-header p {
-  margin: 0 0 0.8vh;
+  margin: 0 0 0.3vh;
   color: #af8652;
   font-family: system-ui, sans-serif;
-  font-size: 1vw;
+  font-size: 0.88vw;
   letter-spacing: 0.42em;
 }
 
 .game-header h1 {
   margin: 0;
   color: #f9e7bd;
-  font-size: 3.2vw;
+  font-size: 2.65vw;
   letter-spacing: 0.18em;
 }
 
@@ -1576,30 +1580,32 @@ onBeforeUnmount(() => {
 .side-column {
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  justify-content: flex-start;
   width: 20vw;
   max-width: 360px;
+  height: 95vh;
+  max-height: calc(100vh - 5vh);
   margin-left: 4vw;
 }
 
 .status-panel {
   width: 100%;
-  padding: 1.4vh 2vw;
+  padding: 1.1vh 1.45vw;
   border-left: 2px solid rgba(205, 155, 88, 0.45);
   background: rgba(40, 26, 17, 0.55);
 }
 
 .phase-label {
-  margin: 0 0 1.2vh;
+  margin: 0 0 0.7vh;
   color: #b7986d;
-  font-size: 1.2vw;
+  font-size: 1.08vw;
   letter-spacing: 0.3em;
 }
 
 .turn-card {
   display: flex;
   align-items: center;
-  padding: 1.3vh 1.4vw;
+  padding: 0.85vh 1vw;
   border: 1px solid rgba(224, 177, 103, 0.5);
   background: rgba(85, 42, 24, 0.46);
 }
@@ -1616,9 +1622,9 @@ onBeforeUnmount(() => {
 }
 
 .player-marker {
-  width: 3vw;
-  height: 3vw;
-  margin-right: 1.4vw;
+  width: 2.65vw;
+  height: 2.65vw;
+  margin-right: 1vw;
   border: 3px solid currentColor;
   border-radius: 50%;
   background: #d7ad68;
@@ -1641,24 +1647,24 @@ onBeforeUnmount(() => {
 .turn-card small {
   color: #bca98d;
   font-family: system-ui, sans-serif;
-  font-size: 1vw;
+  font-size: 0.94vw;
 }
 
 .turn-card strong {
-  margin-top: 0.4vh;
+  margin-top: 0.2vh;
   color: #f0d29a;
-  font-size: 2vw;
+  font-size: 1.85vw;
   letter-spacing: 0.16em;
 }
 
 dl {
-  margin: 1.25vh 0;
+  margin: 0.8vh 0;
 }
 
 dl div {
   display: flex;
   justify-content: space-between;
-  padding: 0.5vh 0;
+  padding: 0.38vh 0;
   border-bottom: 1px solid rgba(196, 154, 98, 0.2);
 }
 
@@ -1666,7 +1672,7 @@ dt,
 dd {
   margin: 0;
   font-family: system-ui, sans-serif;
-  font-size: 1.15vw;
+  font-size: 1.12vw;
 }
 
 dt {
@@ -1681,16 +1687,19 @@ dd {
   margin: 0;
   color: #8f7b65;
   font-family: system-ui, sans-serif;
-  font-size: 0.95vw;
-  line-height: 1.6;
+  font-size: 0.83vw;
+  line-height: 1.45;
 }
 
 .game-actions {
   display: grid;
+  flex: 1;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.7vh;
+  grid-template-rows: repeat(4, minmax(0, 1fr));
+  gap: 0.65vh;
   width: 100%;
-  margin-top: 1vh;
+  min-height: 0;
+  margin-top: 0.85vh;
 }
 
 .action-button {
@@ -1698,15 +1707,21 @@ dd {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 0.35vh;
+  gap: 0.55vh;
   width: 100%;
-  min-height: 5.2vh;
-  padding: 0.4vh 0.6vw;
+  min-height: 0;
+  padding: 0.55vh 0.55vw;
   border: 2px solid rgba(201, 157, 94, 0.42);
   outline: none;
-  background: rgba(58, 37, 23, 0.86);
+  background:
+    linear-gradient(145deg, rgba(92, 57, 32, 0.88), rgba(49, 31, 20, 0.94));
   color: #edd4a4;
   cursor: pointer;
+  box-shadow: inset 0 1px rgba(255, 231, 171, 0.05);
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    transform 140ms ease;
 }
 
 .action-button strong,
@@ -1715,19 +1730,20 @@ dd {
 }
 
 .action-button strong {
-  font-size: 1.05vw;
+  font-size: 1vw;
   letter-spacing: 0.12em;
 }
 
 .action-button small {
   color: #a99579;
-  font-size: 0.8vw;
+  font-size: 0.72vw;
   white-space: nowrap;
 }
 
 .action-button:hover:not(:disabled) {
   border-color: rgba(255, 231, 171, 0.8);
   background: rgba(87, 54, 31, 0.94);
+  transform: translateY(-1px);
 }
 
 .action-button--focused {
@@ -1745,15 +1761,16 @@ dd {
 
 .action-button--wide {
   grid-column: 1 / -1;
-  min-height: 4.5vh;
   flex-direction: row;
+  border-color: rgba(218, 172, 101, 0.58);
+  background:
+    linear-gradient(135deg, rgba(111, 69, 34, 0.94), rgba(58, 35, 21, 0.96));
 }
 
 .action-button--wide small {
   margin-left: 0.8vw;
 }
 
-.depth-picker-overlay,
 .experience-overlay {
   position: fixed;
   z-index: 100;
@@ -1765,93 +1782,6 @@ dd {
   align-items: center;
   justify-content: center;
   background: rgba(10, 7, 5, 0.78);
-}
-
-.depth-picker-dialog {
-  box-sizing: border-box;
-  width: 58vw;
-  max-width: 980px;
-  max-height: 82vh;
-  padding: 3.2vh 3vw;
-  overflow: hidden;
-  border: 3px solid #8a5c30;
-  background: #21150e;
-  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.68);
-}
-
-.depth-picker-heading {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  margin-bottom: 2.2vh;
-}
-
-.depth-picker-heading h2 {
-  margin: 0;
-  color: #f5deb0;
-  font-size: 2.35vw;
-  letter-spacing: 0.12em;
-}
-
-.depth-picker-heading > span {
-  padding: 0.8vh 1vw;
-  border: 1px solid rgba(205, 155, 88, 0.45);
-  color: #d5b77f;
-  font-family: system-ui, sans-serif;
-  font-size: 1.05vw;
-}
-
-.depth-picker-grid {
-  display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 1.2vh 0.8vw;
-}
-
-.depth-option {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  min-height: 8vh;
-  padding: 0.7vh 0.4vw;
-  border: 2px solid rgba(201, 157, 94, 0.38);
-  outline: none;
-  background: rgba(53, 33, 21, 0.92);
-  color: #e8ca92;
-  cursor: pointer;
-}
-
-.depth-option strong {
-  font-family: system-ui, sans-serif;
-  font-size: 1.55vw;
-}
-
-.depth-option small {
-  min-height: 1em;
-  margin-top: 0.25vh;
-  color: #aa8c60;
-  font-family: system-ui, sans-serif;
-  font-size: 0.75vw;
-}
-
-.depth-option--selected {
-  border-color: rgba(224, 177, 103, 0.88);
-  background: rgba(91, 54, 29, 0.94);
-}
-
-.depth-option:hover,
-.depth-option--focused {
-  border-color: #ffd65a;
-  background: rgba(113, 78, 29, 0.98);
-  box-shadow: 0 0 14px rgba(255, 213, 77, 0.55);
-}
-
-.depth-picker-hint {
-  margin: 2vh 0 0;
-  color: #9c876c;
-  font-family: system-ui, sans-serif;
-  font-size: 0.95vw;
-  text-align: center;
 }
 
 .experience-dialog {
@@ -2050,26 +1980,6 @@ dd {
 
   .experience-dialog h2 {
     font-size: 48px;
-  }
-
-  .depth-picker-heading h2 {
-    font-size: 44px;
-  }
-
-  .depth-picker-heading > span {
-    font-size: 20px;
-  }
-
-  .depth-option strong {
-    font-size: 30px;
-  }
-
-  .depth-option small {
-    font-size: 15px;
-  }
-
-  .depth-picker-hint {
-    font-size: 19px;
   }
 
   .setting-control {
