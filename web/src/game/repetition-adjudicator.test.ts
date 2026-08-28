@@ -59,4 +59,29 @@ describe('repetition adjudicator', () => {
 
     expect(adjudicateRepetition(history)).toEqual({ type: 'repetition-draw' })
   })
+
+  it('detects three occurrences reached through different-length paths', () => {
+    const history: PositionHistoryEntry[] = [createInitialPositionEntry(BASE_BOARD, 'red')]
+    const initialKey = history[0]?.key ?? ''
+    history.push(entry('short-response', 'red', false))
+    history.push(entry(initialKey, 'black', true))
+    history.push(entry('long-response-a', 'red', false))
+    history.push(entry('long-check-a', 'black', true))
+    history.push(entry('long-response-b', 'red', false))
+    history.push(entry(initialKey, 'black', true))
+
+    expect(adjudicateRepetition(history)).toEqual({
+      type: 'perpetual-check',
+      offender: 'black',
+      winner: 'red',
+    })
+  })
+
+  it('does not adjudicate before the current position occurs three times', () => {
+    const history: PositionHistoryEntry[] = [createInitialPositionEntry(BASE_BOARD, 'red')]
+    history.push(entry('response', 'red', false))
+    history.push(entry(history[0]?.key ?? '', 'black', true))
+
+    expect(adjudicateRepetition(history)).toBeNull()
+  })
 })

@@ -14,8 +14,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadOnlyPaths=/var/lib/xiangqi-api
-ReadWritePaths=/var/backups/xiangqi-api
+# SQLite 的只读 WAL 连接仍可能需要创建/访问 -shm 辅助文件；脚本自身通过
+# mode=ro 与 PRAGMA query_only 保证不会修改主数据库。
+ReadWritePaths=/var/lib/xiangqi-api /var/backups/xiangqi-api
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

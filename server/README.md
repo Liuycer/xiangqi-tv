@@ -53,6 +53,9 @@ Completed AI games are added to a persistent SQLite review queue. The worker
 analyzes one red move at a time with a bounded movetime, stores a checkpoint
 after every move, and yields the shared engine whenever an interactive move or
 analysis request is waiting. Interrupted jobs return to the queue on restart.
+Transient database failures while claiming a job or recording its failure are
+contained inside the worker loop, so one storage error cannot permanently stop
+all later reviews.
 
 After review, an idempotent shadow-rating event compares the game result with
 the internal A0–A7 opponent profile. Games with fallback search, undo, changed
@@ -61,6 +64,11 @@ change the rating. Phase 25–28 exposes device-owned player profiles through
 `/v1/xiangqi/profiles`; each profile has independent rating, level, games and
 review history. New profiles start at A1 / 1050 and gameplay always applies the
 active profile's adaptive level.
+
+All profile-owned game, history and legacy adaptive endpoints require both
+`deviceId` and `playerId`. The server verifies that pair before reading or
+changing data; clients that omit the device identity are intentionally rejected
+with HTTP 422 starting with API version 0.4.
 
 ## Runtime configuration
 
@@ -116,9 +124,14 @@ response and does not expose player data.
 Install `systemd/xiangqi-database-backup.service` and its timer, create
 `/var/backups/xiangqi-api` owned by the `xiangqi` service user, then enable the
 timer. It creates an online gzip-compressed SQLite snapshot every day and keeps
-14 days by default. To upload each snapshot to Cloudflare R2, configure an
-`rclone` remote and set `XIANGQI_BACKUP_RCLONE_REMOTE`; the live SQLite database
-must remain on local block storage.
+14 days by default. The live WAL database is opened explicitly in read-only
+mode, and every compressed snapshot is restored to a temporary file and checked
+with `PRAGMA quick_check` before it is published. The systemd unit permits writes
+in the database directory because SQLite WAL mode can require creating or
+updating the `-shm` helper file even when the database connection is read-only.
+To upload each snapshot to Cloudflare R2, configure an `rclone` remote and set
+`XIANGQI_BACKUP_RCLONE_REMOTE`; the live SQLite database must remain on local
+block storage.
 
 ## Tests
 

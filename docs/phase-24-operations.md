@@ -36,6 +36,8 @@ Phase 24 为自适应难度补齐可校准参数、运行观测、数据库版�
 
 ## 备份
 
+> 后续生产巡检发现：首次手动备份成功后，定时任务会因 systemd 将 WAL 数据库目录强制设为只读而失败。该问题已在 [Phase 29](phase-29-reliability.md) 修复并重新完成生产验收。
+
 `xiangqi-database-backup.timer` 每天北京时间 04:15 左右调用 SQLite 在线备份 API，输出 gzip 文件到 `/var/backups/xiangqi-api`，默认保留 14 天。备份期间不需要停止服务，且不会直接复制可能仍在变化的 WAL 文件。
 
 可选环境变量：
