@@ -75,6 +75,13 @@ until the first move, an abandoned zero-ply game is deleted with HTTP 204, and
 history queries exclude any zero-ply rows left by older clients. Abandoned games
 with at least one move remain available for replay.
 
+API version 0.5.0 independently replays every submitted move before sending a
+position to Pikafish or saving a game snapshot. It enforces turn order, all
+seven piece movement rules, blockers, palace and river restrictions, own-check,
+flying generals, repetition and perpetual-check termination. Finished records
+are accepted only when `currentPlayer`, result and termination agree with the
+replayed terminal position; abandoned nonterminal records remain valid.
+
 ## Runtime configuration
 
 The systemd unit reads `/etc/xiangqi-engine-api.env`:

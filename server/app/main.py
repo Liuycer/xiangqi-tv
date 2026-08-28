@@ -24,6 +24,13 @@ from .game_store import (
     ProfileNotFound,
     SCHEMA_VERSION,
 )
+from .xiangqi_rules import (
+    IllegalPosition,
+    parse_fen,
+    validate_finished_game,
+    validate_replay,
+    validate_snapshot,
+)
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -160,6 +167,10 @@ def validate_fen(value: str) -> str:
 
     if board.count("K") != 1 or board.count("k") != 1:
         raise ValueError("FEN 必须各包含一个红帅和黑将")
+    try:
+        parse_fen(value)
+    except IllegalPosition as error:
+        raise ValueError(str(error)) from error
     return value
 
 
@@ -190,6 +201,14 @@ class PositionRequest(BaseModel):
         if any(not MOVE_PATTERN.fullmatch(move) for move in moves):
             raise ValueError("走法必须使用 UCI 坐标格式，例如 h2e2")
         return moves
+
+    @model_validator(mode="after")
+    def position_is_legal(self) -> "PositionRequest":
+        try:
+            validate_replay(self.fen, self.moves)
+        except IllegalPosition as error:
+            raise ValueError(str(error)) from error
+        return self
 
 
 class MoveRequest(PositionRequest):
@@ -1215,7 +1234,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Xiangqi TV Engine API",
-    version="0.4.1",
+    version="0.5.0",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
@@ -1548,6 +1567,12 @@ async def update_game_snapshot(
             payload.playerId,
             game_id,
         )
+        validation = await game_store.get_game_validation_context(game_id)
+        validate_snapshot(
+            str(validation["initialFen"]),
+            payload.moves,
+            payload.currentPlayer,
+        )
         stored = await game_store.update_snapshot(
             game_id,
             moves=payload.moves,
@@ -1558,6 +1583,8 @@ async def update_game_snapshot(
         )
     except GameNotFound as error:
         raise HTTPException(status_code=404, detail="对局不存在") from error
+    except IllegalPosition as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     return StoredGame(**stored)
 
 
@@ -1578,6 +1605,18 @@ async def finish_game(
             payload.playerId,
             game_id,
         )
+        validation = await game_store.get_game_validation_context(game_id)
+        replay = validate_snapshot(
+            str(validation["initialFen"]),
+            payload.moves,
+            payload.currentPlayer,
+        )
+        validate_finished_game(
+            replay,
+            state=payload.state,
+            result=payload.result,
+            termination=payload.termination,
+        )
         stored = await game_store.finish_game(
             game_id,
             state=payload.state,
@@ -1591,6 +1630,8 @@ async def finish_game(
         )
     except GameNotFound as error:
         raise HTTPException(status_code=404, detail="对局不存在") from error
+    except IllegalPosition as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     if stored is None:
         return Response(status_code=204)
     return StoredGame(**stored)
