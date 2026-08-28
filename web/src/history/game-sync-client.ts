@@ -6,6 +6,10 @@ const DEVICE_STORAGE_KEY = 'xiangqi-tv-device-id-v1'
 const ACTIVE_PROFILE_STORAGE_KEY = 'xiangqi-tv-active-profile-v1'
 const PROFILE_CACHE_STORAGE_KEY = 'xiangqi-tv-profiles-v1'
 const REQUEST_TIMEOUT_MS = 8_000
+// Nginx permits 30 requests/minute and authenticated writes may also trigger
+// a CORS preflight. Pace recovered offline writes so a backlog cannot consume
+// the entire burst allowance and block interactive history/profile requests.
+const OUTBOX_FLUSH_INTERVAL_MS = 4_200
 
 export interface GameStartPayload {
   readonly clientGameId: string
@@ -509,6 +513,11 @@ export class GameSyncClient {
         }
         this.outbox = this.outbox.filter((queued) => queued.id !== operation.id)
         saveOperations(this.outbox)
+        if (this.outbox.length > 0) {
+          await new Promise<void>((resolve) => {
+            globalThis.setTimeout(resolve, OUTBOX_FLUSH_INTERVAL_MS)
+          })
+        }
       } catch {
         return
       } finally {

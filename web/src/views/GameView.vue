@@ -125,6 +125,7 @@ const historyDetail = ref<GameHistoryDetail | null>(null)
 const historySelectedGameId = ref<string | null>(null)
 const historyReplayPly = ref(0)
 const historyFocusIndex = ref(1)
+const profilePanelRef = ref<InstanceType<typeof ProfilePanel> | null>(null)
 const soundController = new SoundController(experienceSettings.value.soundEnabled)
 let aiGeneration = 0
 let analysisGeneration = 0
@@ -432,6 +433,9 @@ function undoMatch(): boolean {
   cancelAnalysisRequest(true)
   cancelAiSearch()
   const snapshot = gameController.getSnapshot()
+  if (isFinished(snapshot.status)) {
+    return false
+  }
   const undoTwice = gameMode.value === 'ai'
     && snapshot.currentPlayer === 'red'
     && snapshot.history.length >= 2
@@ -674,7 +678,9 @@ async function loadGameHistory(): Promise<void> {
   historyLoading.value = true
   historyError.value = null
   try {
-    await gameSyncClient.flush()
+    // Pending offline writes are drained in the background. History reads must
+    // not wait for a potentially long queue or share its old burst traffic.
+    void gameSyncClient.flush()
     const page = await gameSyncClient.getGameHistory(deviceId, playerId.value)
     if (generation !== historyGeneration || !historyOpen.value) return
     historyItems.value = page.items
@@ -1032,7 +1038,10 @@ function handleOpenHistory(event?: MouseEvent): void {
 function handleKeyDown(event: KeyboardEvent): void {
   if (profileOpen.value) {
     let handled = true
-    const maximum = Math.max(0, profiles.value.length - 1)
+    const canCreate = profiles.value.length < maxProfiles.value
+    const maximum = canCreate
+      ? profiles.value.length
+      : Math.max(0, profiles.value.length - 1)
     if (event.key === 'ArrowLeft') {
       profileFocusIndex.value = Math.max(0, profileFocusIndex.value - 1)
     } else if (event.key === 'ArrowRight') {
@@ -1042,8 +1051,12 @@ function handleKeyDown(event: KeyboardEvent): void {
     } else if (event.key === 'ArrowDown') {
       profileFocusIndex.value = Math.min(maximum, profileFocusIndex.value + 2)
     } else if (event.key === 'Enter') {
-      const profile = profiles.value[profileFocusIndex.value]
-      if (profile) void selectProfile(profile.profileId)
+      if (canCreate && profileFocusIndex.value === profiles.value.length) {
+        profilePanelRef.value?.startCreate()
+      } else {
+        const profile = profiles.value[profileFocusIndex.value]
+        if (profile) void selectProfile(profile.profileId)
+      }
     } else if (event.key === 'Escape' || event.key === 'Backspace') {
       closeProfilePanel()
     } else {
@@ -1192,6 +1205,9 @@ onMounted(() => {
   void loadProfiles()
   window.__xiangqiHandleBack = () => {
     if (profileOpen.value) {
+      if (profilePanelRef.value?.closeEditor()) {
+        return true
+      }
       closeProfilePanel()
       return true
     }
@@ -1325,7 +1341,7 @@ onBeforeUnmount(() => {
             class="action-button"
             :class="{ 'action-button--focused': inputState.mode === 'remote' && inputState.area === 'actions' && inputState.actionIndex === 0 }"
             type="button"
-            :disabled="gameState.history.length === 0"
+            :disabled="gameState.history.length === 0 || isFinished(gameState.status)"
             data-action-index="0"
             @click="handleUndo"
           >
@@ -1480,6 +1496,7 @@ onBeforeUnmount(() => {
     </div>
 
     <ProfilePanel
+      ref="profilePanelRef"
       v-if="profileOpen"
       :input-mode="inputState.mode"
       :profiles="profiles"

@@ -27,17 +27,21 @@ const emit = defineEmits<{
 }>()
 
 function formatDate(value: string): string {
-  const date = new Date(value)
+  // SQLite CURRENT_TIMESTAMP is UTC but is returned without a zone suffix.
+  // WebView otherwise interprets it as local time and shifts it incorrectly.
+  const normalizedValue = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(value)
+    ? `${value.replace(' ', 'T')}Z`
+    : value
+  const date = new Date(normalizedValue)
   if (Number.isNaN(date.getTime())) {
     return value
   }
-  return new Intl.DateTimeFormat('zh-CN', {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).format(date)
+  // The Q8's older WebView ignores Intl's timeZone option. Apply UTC+8
+  // explicitly, then read UTC fields so the result never depends on the
+  // Android system time zone or its bundled time-zone database.
+  const beijingDate = new Date(date.getTime() + 8 * 60 * 60 * 1000)
+  const pad = (part: number): string => String(part).padStart(2, '0')
+  return `${pad(beijingDate.getUTCMonth() + 1)}/${pad(beijingDate.getUTCDate())} ${pad(beijingDate.getUTCHours())}:${pad(beijingDate.getUTCMinutes())}`
 }
 
 function resultLabel(item: GameHistorySummary): string {
@@ -76,6 +80,18 @@ function analysisLabel(item: GameHistorySummary): string {
   }
   return labels[item.analysisState] ?? item.analysisState
 }
+
+function classificationLabel(value: string | null | undefined): string {
+  if (!value) return ''
+  const labels: Readonly<Record<string, string>> = {
+    good: '好棋',
+    inaccuracy: '不精确',
+    mistake: '失误',
+    blunder: '漏着',
+    unknown: '未评级',
+  }
+  return labels[value] ?? value
+}
 </script>
 
 <template>
@@ -111,8 +127,10 @@ function analysisLabel(item: GameHistorySummary): string {
             }"
             @click="emit('select', item.id)"
           >
-            <span>{{ formatDate(item.startedAt) }}</span>
-            <strong>{{ resultLabel(item) }}</strong>
+            <span class="history-item-heading">
+              <span>{{ formatDate(item.startedAt) }}</span>
+              <strong>{{ resultLabel(item) }}</strong>
+            </span>
             <small>{{ difficultyLabel(item) }} · {{ item.plyCount }} 手</small>
             <small>{{ analysisLabel(item) }}</small>
           </button>
@@ -164,7 +182,7 @@ function analysisLabel(item: GameHistorySummary): string {
                   <span>{{ move.ply }}</span>
                   <strong>{{ move.notation }}</strong>
                   <small v-if="detail.moves[move.ply - 1]?.classification">
-                    {{ detail.moves[move.ply - 1]?.classification }}
+                    {{ classificationLabel(detail.moves[move.ply - 1]?.classification) }}
                   </small>
                 </li>
               </ol>
@@ -241,10 +259,11 @@ function analysisLabel(item: GameHistorySummary): string {
 }
 
 .history-item {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 0.25vh 0.7vw;
-  min-height: 8.2vh;
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 0.3vh;
+  min-height: 10.5vh;
   padding: 0.8vh 0.9vw;
   border: 2px solid rgba(145, 103, 61, 0.45);
   background: rgba(48, 31, 20, 0.9);
@@ -252,9 +271,10 @@ function analysisLabel(item: GameHistorySummary): string {
   text-align: left;
   cursor: pointer;
 }
-.history-item span { color: #a78a68; font-size: 0.85vw; }
-.history-item strong { font-size: 1.05vw; }
-.history-item small { grid-column: 1 / -1; color: #aa9477; font-size: 0.78vw; }
+.history-item-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 0.7vw; width: 100%; }
+.history-item-heading > span { color: #a78a68; font-size: 0.85vw; }
+.history-item-heading > strong { color: #d7bd91; font-size: 1.05vw; }
+.history-item small { color: #aa9477; font-size: 0.78vw; line-height: 1.35; }
 .history-item--selected { border-color: #e1ad58; background: rgba(84, 54, 29, 0.94); }
 
 .replay-area {
@@ -291,7 +311,7 @@ function analysisLabel(item: GameHistorySummary): string {
   .history-heading p { font-size: 17px; }
   .history-heading h2 { font-size: 43px; }
   .close-button, .history-item strong, .replay-summary span, .replay-controls button, .replay-controls > strong { font-size: 20px; }
-  .history-item span { font-size: 17px; }
+  .history-item-heading > span { font-size: 17px; }
   .history-item small, .history-hint, .inline-error { font-size: 16px; }
   .replay-summary strong { font-size: 30px; }
   .replay-moves li { font-size: 18px; }
