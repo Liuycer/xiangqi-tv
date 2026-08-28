@@ -7,11 +7,17 @@ from unittest.mock import AsyncMock, patch
 from pydantic import ValidationError
 
 from app.main import (
+    AdaptiveLockRequest,
+    AdaptiveResetRequest,
     AnalysisLine,
     AnalysisRequest,
+    GameSnapshotRequest,
+    GameStartRequest,
     MAX_ANALYSIS_MULTIPV,
     MoveRequest,
     PikafishEngine,
+    PostGameAnalysisWorker,
+    app,
     get_humanized_policy,
     get_side_to_move,
     select_humanized_line,
@@ -22,6 +28,81 @@ INITIAL_FEN = (
     "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/"
     "P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1"
 )
+
+
+class CorsConfigurationTests(unittest.TestCase):
+    def test_profile_mutation_methods_are_allowed(self) -> None:
+        cors = next(
+            middleware
+            for middleware in app.user_middleware
+            if middleware.cls.__name__ == "CORSMiddleware"
+        )
+
+        self.assertIn("PATCH", cors.kwargs["allow_methods"])
+        self.assertIn("DELETE", cors.kwargs["allow_methods"])
+        self.assertIn("OPTIONS", cors.kwargs["allow_methods"])
+
+
+class DeviceOwnershipRequestTests(unittest.TestCase):
+    def test_game_writes_require_device_and_profile_identifiers(self) -> None:
+        with self.assertRaises(ValidationError):
+            GameStartRequest(
+                clientGameId="game_12345678",
+                playerId="profile_12345678",
+                mode="ai",
+                difficulty="adaptive",
+                initialFen=INITIAL_FEN,
+            )
+        with self.assertRaises(ValidationError):
+            GameSnapshotRequest(
+                deviceId="device_12345678",
+                moves=[],
+                currentPlayer="red",
+            )
+
+    def test_legacy_adaptive_mutations_require_device_identifier(self) -> None:
+        with self.assertRaises(ValidationError):
+            AdaptiveLockRequest(playerId="profile_12345678", level=2)
+        with self.assertRaises(ValidationError):
+            AdaptiveResetRequest(playerId="profile_12345678")
+
+    def test_history_and_profile_queries_require_device_identifier(self) -> None:
+        schema = app.openapi()
+        for path in (
+            "/v1/xiangqi/adaptive/profile",
+            "/v1/xiangqi/games",
+            "/v1/xiangqi/games/{game_id}",
+        ):
+            parameters = schema["paths"][path]["get"]["parameters"]
+            device = next(item for item in parameters if item["name"] == "deviceId")
+            self.assertTrue(device["required"], path)
+
+
+class PostGameAnalysisWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_claim_failure_does_not_stop_the_worker(self) -> None:
+        store = AsyncMock()
+        store.claim_analysis_job.side_effect = OSError("temporary database error")
+        worker = PostGameAnalysisWorker(store, AsyncMock())
+
+        self.assertFalse(await worker.run_once())
+        store.claim_analysis_job.assert_awaited_once()
+
+    async def test_failure_state_error_does_not_escape_the_worker(self) -> None:
+        store = AsyncMock()
+        store.claim_analysis_job.return_value = {
+            "id": "job-1",
+            "gameId": "game-1",
+            "nextPly": 1,
+        }
+        store.get_analysis_input.side_effect = OSError("temporary database error")
+        store.fail_analysis_job.side_effect = OSError("database still unavailable")
+        worker = PostGameAnalysisWorker(store, AsyncMock())
+
+        self.assertTrue(await worker.run_once())
+        store.fail_analysis_job.assert_awaited_once_with(
+            "job-1",
+            "temporary database error",
+        )
 
 
 class AnalysisRequestTests(unittest.TestCase):

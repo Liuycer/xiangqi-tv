@@ -761,7 +761,10 @@ function previewAnalysisCandidate(rank: number | null): void {
 }
 
 function confirmAnalysisCandidate(rank: number): void {
-  if (!analysisResult.value?.candidates.some((candidate) => candidate.rank === rank)) {
+  if (
+    analysisThinking.value
+    || !analysisResult.value?.candidates.some((candidate) => candidate.rank === rank)
+  ) {
     return
   }
   analysisCandidateRank.value = rank
@@ -775,6 +778,7 @@ async function requestPositionAnalysis(): Promise<void> {
   if (
     !analysisOpen.value
     || aiThinking.value
+    || analysisThinking.value
     || isFinished(snapshot.status)
     || !remoteAiClient.isConfigured()
   ) {
@@ -851,7 +855,7 @@ function activateExperienceControl(): void {
     toggleSound()
   } else if (experienceFocusIndex.value === 1) {
     toggleMotion()
-  } else if (experienceFocusIndex.value === 2) {
+  } else if (experienceFocusIndex.value === 2 && adaptiveProfile.value.adaptiveEnabled) {
     void resetProfile(playerId.value)
   } else {
     closeExperiencePanel()

@@ -1,6 +1,7 @@
 import { getDefaultRemoteAiConfig, type RemoteAiConfig } from '../ai/remote-ai-client'
 
 const OUTBOX_STORAGE_KEY = 'xiangqi-tv-game-outbox-v1'
+const FAILED_OUTBOX_STORAGE_KEY = 'xiangqi-tv-game-outbox-failed-v1'
 const PLAYER_STORAGE_KEY = 'xiangqi-tv-player-id-v1'
 const DEVICE_STORAGE_KEY = 'xiangqi-tv-device-id-v1'
 const ACTIVE_PROFILE_STORAGE_KEY = 'xiangqi-tv-active-profile-v1'
@@ -10,6 +11,7 @@ const REQUEST_TIMEOUT_MS = 8_000
 // a CORS preflight. Pace recovered offline writes so a backlog cannot consume
 // the entire burst allowance and block interactive history/profile requests.
 const OUTBOX_FLUSH_INTERVAL_MS = 4_200
+const MAX_FAILED_OPERATIONS = 30
 
 export interface GameStartPayload {
   readonly clientGameId: string
@@ -136,6 +138,11 @@ interface QueuedOperation {
   readonly body: Record<string, unknown>
 }
 
+interface FailedOperation extends QueuedOperation {
+  readonly failedAt: string
+  readonly status: number
+}
+
 function createIdentifier(prefix: string): string {
   const values = new Uint32Array(4)
   globalThis.crypto.getRandomValues(values)
@@ -166,6 +173,40 @@ function saveOperations(operations: ReadonlyArray<QueuedOperation>): void {
   } catch {
     // A storage failure must never block the board interaction path.
   }
+}
+
+function quarantineOperations(
+  operations: ReadonlyArray<QueuedOperation>,
+  failedOperationId: string,
+  status: number,
+): void {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(FAILED_OUTBOX_STORAGE_KEY) ?? '[]')
+    const previous = Array.isArray(stored) ? stored as FailedOperation[] : []
+    const failedAt = new Date().toISOString()
+    const quarantined = operations.map((operation): FailedOperation => ({
+      ...operation,
+      // Operations from the same game depend on its rejected predecessor and
+      // are quarantined together instead of producing a chain of predictable 4xx responses.
+      status: operation.id === failedOperationId ? status : 424,
+      failedAt,
+    }))
+    localStorage.setItem(
+      FAILED_OUTBOX_STORAGE_KEY,
+      JSON.stringify([...previous, ...quarantined].slice(-MAX_FAILED_OPERATIONS)),
+    )
+  } catch {
+    // Diagnostics are best effort; removing a poison item must still unblock sync.
+  }
+}
+
+function isRetryableSyncStatus(status: number): boolean {
+  return status === 401
+    || status === 403
+    || status === 408
+    || status === 425
+    || status === 429
+    || status >= 500
 }
 
 export function loadOrCreatePlayerId(): string {
@@ -352,16 +393,24 @@ export class GameSyncClient {
     return this.parseAdaptiveProfile(payload)
   }
 
-  async setAdaptiveLock(playerId: string, level: number | null): Promise<AdaptiveProfile> {
+  async setAdaptiveLock(
+    deviceId: string,
+    playerId: string,
+    level: number | null,
+  ): Promise<AdaptiveProfile> {
     const payload = await this.requestJson('POST', '/v1/xiangqi/adaptive/lock', {
+      deviceId,
       playerId,
       level,
     })
     return this.parseAdaptiveProfile(payload)
   }
 
-  async resetAdaptiveProfile(playerId: string): Promise<AdaptiveProfile> {
-    const payload = await this.requestJson('POST', '/v1/xiangqi/adaptive/reset', { playerId })
+  async resetAdaptiveProfile(deviceId: string, playerId: string): Promise<AdaptiveProfile> {
+    const payload = await this.requestJson('POST', '/v1/xiangqi/adaptive/reset', {
+      deviceId,
+      playerId,
+    })
     return this.parseAdaptiveProfile(payload)
   }
 
@@ -509,10 +558,20 @@ export class GameSyncClient {
           },
         )
         if (!response.ok) {
-          throw new Error(`对局同步失败：HTTP ${response.status}`)
+          if (isRetryableSyncStatus(response.status)) {
+            return
+          }
+          const rejectedGameOperations = this.outbox.filter(
+            (queued) => queued.gameId === operation.gameId,
+          )
+          const rejectedIds = new Set(rejectedGameOperations.map((queued) => queued.id))
+          quarantineOperations(rejectedGameOperations, operation.id, response.status)
+          this.outbox = this.outbox.filter((queued) => !rejectedIds.has(queued.id))
+          saveOperations(this.outbox)
+        } else {
+          this.outbox = this.outbox.filter((queued) => queued.id !== operation.id)
+          saveOperations(this.outbox)
         }
-        this.outbox = this.outbox.filter((queued) => queued.id !== operation.id)
-        saveOperations(this.outbox)
         if (this.outbox.length > 0) {
           await new Promise<void>((resolve) => {
             globalThis.setTimeout(resolve, OUTBOX_FLUSH_INTERVAL_MS)

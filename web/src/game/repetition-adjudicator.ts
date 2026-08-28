@@ -32,26 +32,7 @@ export function createInitialPositionEntry(
   })
 }
 
-function cyclesMatch(
-  entries: ReadonlyArray<PositionHistoryEntry>,
-  first: number,
-  second: number,
-  third: number,
-): boolean {
-  const cycleLength = second - first
-  if (cycleLength <= 0 || third - second !== cycleLength) {
-    return false
-  }
-
-  for (let offset = 0; offset <= cycleLength; offset += 1) {
-    if (entries[first + offset]?.key !== entries[second + offset]?.key) {
-      return false
-    }
-  }
-  return true
-}
-
-function findLatestRepeatedCycle(
+function findLatestRepetitionWindow(
   entries: ReadonlyArray<PositionHistoryEntry>,
 ): ReadonlyArray<PositionHistoryEntry> | null {
   const third = entries.length - 1
@@ -67,23 +48,15 @@ function findLatestRepeatedCycle(
     }
   }
 
-  for (let secondIndex = occurrences.length - 2; secondIndex >= 1; secondIndex -= 1) {
-    const second = occurrences[secondIndex]
-    if (second === undefined) {
-      continue
-    }
-    const cycleLength = third - second
-    const first = second - cycleLength
-    if (
-      first >= 0
-      && entries[first]?.key === currentKey
-      && cyclesMatch(entries, first, second, third)
-    ) {
-      return entries.slice(second + 1, third + 1)
-    }
+  if (occurrences.length < 3) {
+    return null
   }
 
-  return null
+  // A position has repeated three times when its placement and side to move
+  // occur three times. The paths between those occurrences need not have the
+  // same length or repeat the exact same intermediate positions.
+  const first = occurrences[occurrences.length - 3]
+  return first === undefined ? null : entries.slice(first + 1, third + 1)
 }
 
 function isPerpetualCheck(
@@ -97,13 +70,13 @@ function isPerpetualCheck(
 export function adjudicateRepetition(
   entries: ReadonlyArray<PositionHistoryEntry>,
 ): RepetitionDecision | null {
-  const cycle = findLatestRepeatedCycle(entries)
-  if (!cycle) {
+  const repetitionWindow = findLatestRepetitionWindow(entries)
+  if (!repetitionWindow) {
     return null
   }
 
-  const redPerpetualCheck = isPerpetualCheck(cycle, 'red')
-  const blackPerpetualCheck = isPerpetualCheck(cycle, 'black')
+  const redPerpetualCheck = isPerpetualCheck(repetitionWindow, 'red')
+  const blackPerpetualCheck = isPerpetualCheck(repetitionWindow, 'black')
 
   if (redPerpetualCheck !== blackPerpetualCheck) {
     return redPerpetualCheck

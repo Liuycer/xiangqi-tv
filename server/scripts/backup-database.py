@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,6 +20,30 @@ def required_path(name: str, default: str) -> Path:
     if path == Path("/"):
         raise RuntimeError(f"{name} 不能指向根目录")
     return path
+
+
+def open_readonly_database(database_path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        f"{database_path.as_uri()}?mode=ro",
+        uri=True,
+        timeout=30,
+    )
+    connection.execute("PRAGMA query_only = ON")
+    return connection
+
+
+def verify_database(database_path: Path) -> None:
+    with closing(open_readonly_database(database_path)) as connection:
+        result = connection.execute("PRAGMA quick_check").fetchall()
+    if result != [("ok",)]:
+        raise RuntimeError(f"备份数据库完整性校验失败：{result!r}")
+
+
+def verify_compressed_backup(archive_path: Path, restored_path: Path) -> None:
+    with gzip.open(archive_path, "rb") as source_file:
+        with restored_path.open("wb") as target_file:
+            shutil.copyfileobj(source_file, target_file)
+    verify_database(restored_path)
 
 
 def main() -> None:
@@ -40,12 +65,14 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix=".xiangqi-backup-", dir=backup_dir) as temp_dir:
         snapshot_path = Path(temp_dir) / "xiangqi.db"
         compressed_path = Path(temp_dir) / "xiangqi.db.gz"
-        with sqlite3.connect(database_path, timeout=30) as source:
-            with sqlite3.connect(snapshot_path) as destination:
+        restored_path = Path(temp_dir) / "verified.db"
+        with closing(open_readonly_database(database_path)) as source:
+            with closing(sqlite3.connect(snapshot_path)) as destination:
                 source.backup(destination)
         with snapshot_path.open("rb") as source_file:
             with gzip.open(compressed_path, "wb", compresslevel=6) as target_file:
                 shutil.copyfileobj(source_file, target_file)
+        verify_compressed_backup(compressed_path, restored_path)
         compressed_path.replace(archive_path)
 
     cutoff = time.time() - retention_days * 86_400

@@ -296,8 +296,8 @@ class ReviewEvaluation(BaseModel):
 
 class GameStartRequest(BaseModel):
     clientGameId: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
-    playerId: str = Field(default="primary", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
-    deviceId: str | None = Field(default=None, min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    playerId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    deviceId: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
     mode: Literal["ai", "local"]
     difficulty: Literal["easy", "normal", "hard", "custom", "adaptive", "local"]
     aiDepth: int | None = Field(default=None, ge=2, le=MAX_DEPTH)
@@ -312,8 +312,8 @@ class GameStartRequest(BaseModel):
 
 
 class GameSnapshotRequest(BaseModel):
-    deviceId: str | None = Field(default=None, min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
-    playerId: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    deviceId: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    playerId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     moves: list[str] = Field(default_factory=list, max_length=300)
     currentPlayer: Literal["red", "black"]
     undoCount: int = Field(default=0, ge=0, le=300)
@@ -326,13 +326,6 @@ class GameSnapshotRequest(BaseModel):
         if any(not MOVE_PATTERN.fullmatch(move) for move in moves):
             raise ValueError("走法必须使用 UCI 坐标格式，例如 h2e2")
         return moves
-
-    @model_validator(mode="after")
-    def ownership_fields_are_paired(self) -> "GameSnapshotRequest":
-        if (self.deviceId is None) != (self.playerId is None):
-            raise ValueError("deviceId 和 playerId 必须同时提供")
-        return self
-
 
 class GameFinishRequest(GameSnapshotRequest):
     state: Literal["completed", "abandoned"]
@@ -398,11 +391,13 @@ class AdaptiveProfileResponse(BaseModel):
 
 
 class AdaptiveLockRequest(BaseModel):
+    deviceId: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
     playerId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     level: int | None = Field(default=None, ge=0, le=7)
 
 
 class AdaptiveResetRequest(BaseModel):
+    deviceId: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
     playerId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
 
 
@@ -1047,12 +1042,24 @@ class PostGameAnalysisWorker:
 
     async def run(self) -> None:
         while True:
-            processed = await self.run_once()
+            try:
+                processed = await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("post-game analysis worker iteration crashed")
+                processed = False
             if not processed:
                 await asyncio.sleep(1)
 
     async def run_once(self) -> bool:
-        job = await self.store.claim_analysis_job()
+        try:
+            job = await self.store.claim_analysis_job()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("post-game analysis job claim failed")
+            return False
         if job is None:
             return False
         job_id = str(job["id"])
@@ -1111,7 +1118,15 @@ class PostGameAnalysisWorker:
             raise
         except Exception as error:
             logger.warning("post-game analysis failed game=%s error=%s", game_id, error)
-            await self.store.fail_analysis_job(job_id, str(error))
+            try:
+                await self.store.fail_analysis_job(job_id, str(error))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "post-game analysis failure state could not be saved game=%s",
+                    game_id,
+                )
             return True
 
 
@@ -1198,7 +1213,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Xiangqi TV Engine API",
-    version="0.3.0",
+    version="0.4.0",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
@@ -1207,7 +1222,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=list(ALLOWED_ORIGINS),
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -1312,11 +1327,10 @@ async def create_game(
     _: Annotated[None, Depends(require_api_token)],
 ) -> StoredGame:
     del _
-    if payload.deviceId is not None:
-        try:
-            await game_store.assert_profile_owner(payload.deviceId, payload.playerId)
-        except ProfileNotFound as error:
-            raise HTTPException(status_code=404, detail="棋手档案不存在") from error
+    try:
+        await game_store.assert_profile_owner(payload.deviceId, payload.playerId)
+    except ProfileNotFound as error:
+        raise HTTPException(status_code=404, detail="棋手档案不存在") from error
     stored = await game_store.create_game(
         client_game_id=payload.clientGameId,
         player_id=payload.playerId,
@@ -1431,17 +1445,16 @@ async def reset_profile(
 @app.get("/v1/xiangqi/adaptive/profile", response_model=AdaptiveProfileResponse)
 async def get_adaptive_profile(
     _: Annotated[None, Depends(require_api_token)],
+    deviceId: str,
     playerId: str = "primary",
-    deviceId: str | None = None,
 ) -> AdaptiveProfileResponse:
     del _
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", playerId):
         raise HTTPException(status_code=422, detail="playerId 格式无效")
-    if deviceId is not None:
-        try:
-            await game_store.assert_profile_owner(deviceId, playerId)
-        except ProfileNotFound as error:
-            raise HTTPException(status_code=404, detail="棋手档案不存在") from error
+    try:
+        await game_store.assert_profile_owner(deviceId, playerId)
+    except ProfileNotFound as error:
+        raise HTTPException(status_code=404, detail="棋手档案不存在") from error
     profile = await game_store.get_player_profile(playerId)
     return adaptive_response(profile)
 
@@ -1449,8 +1462,8 @@ async def get_adaptive_profile(
 @app.get("/v1/xiangqi/games", response_model=GameHistoryList)
 async def list_game_history(
     _: Annotated[None, Depends(require_api_token)],
+    deviceId: str,
     playerId: str = "primary",
-    deviceId: str | None = None,
     limit: int = 20,
     offset: int = 0,
 ) -> GameHistoryList:
@@ -1459,11 +1472,10 @@ async def list_game_history(
         raise HTTPException(status_code=422, detail="playerId 格式无效")
     if limit < 1 or limit > 50 or offset < 0:
         raise HTTPException(status_code=422, detail="分页参数无效")
-    if deviceId is not None:
-        try:
-            await game_store.assert_profile_owner(deviceId, playerId)
-        except ProfileNotFound as error:
-            raise HTTPException(status_code=404, detail="棋手档案不存在") from error
+    try:
+        await game_store.assert_profile_owner(deviceId, playerId)
+    except ProfileNotFound as error:
+        raise HTTPException(status_code=404, detail="棋手档案不存在") from error
     history = await game_store.list_games(playerId, limit=limit, offset=offset)
     return GameHistoryList(**history)
 
@@ -1472,17 +1484,16 @@ async def list_game_history(
 async def get_game_history_detail(
     game_id: str,
     _: Annotated[None, Depends(require_api_token)],
+    deviceId: str,
     playerId: str = "primary",
-    deviceId: str | None = None,
 ) -> GameHistoryDetail:
     del _
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", playerId):
         raise HTTPException(status_code=422, detail="playerId 格式无效")
-    if deviceId is not None:
-        try:
-            await game_store.assert_profile_owner(deviceId, playerId)
-        except ProfileNotFound as error:
-            raise HTTPException(status_code=404, detail="棋手档案不存在") from error
+    try:
+        await game_store.assert_profile_owner(deviceId, playerId)
+    except ProfileNotFound as error:
+        raise HTTPException(status_code=404, detail="棋手档案不存在") from error
     try:
         detail = await game_store.get_game_detail(game_id, playerId)
     except GameNotFound as error:
@@ -1496,6 +1507,10 @@ async def set_adaptive_lock(
     _: Annotated[None, Depends(require_api_token)],
 ) -> AdaptiveProfileResponse:
     del _
+    try:
+        await game_store.assert_profile_owner(payload.deviceId, payload.playerId)
+    except ProfileNotFound as error:
+        raise HTTPException(status_code=404, detail="棋手档案不存在") from error
     profile = await game_store.set_adaptive_lock(payload.playerId, payload.level)
     profile["shadowMode"] = ADAPTIVE_SHADOW_MODE
     profile["adaptiveEnabled"] = ADAPTIVE_ENABLED
@@ -1508,6 +1523,10 @@ async def reset_adaptive_profile(
     _: Annotated[None, Depends(require_api_token)],
 ) -> AdaptiveProfileResponse:
     del _
+    try:
+        await game_store.assert_profile_owner(payload.deviceId, payload.playerId)
+    except ProfileNotFound as error:
+        raise HTTPException(status_code=404, detail="棋手档案不存在") from error
     profile = await game_store.reset_player_rating(payload.playerId)
     profile["shadowMode"] = ADAPTIVE_SHADOW_MODE
     profile["adaptiveEnabled"] = ADAPTIVE_ENABLED
@@ -1522,12 +1541,11 @@ async def update_game_snapshot(
 ) -> StoredGame:
     del _
     try:
-        if payload.deviceId is not None and payload.playerId is not None:
-            await game_store.assert_game_owner(
-                payload.deviceId,
-                payload.playerId,
-                game_id,
-            )
+        await game_store.assert_game_owner(
+            payload.deviceId,
+            payload.playerId,
+            game_id,
+        )
         stored = await game_store.update_snapshot(
             game_id,
             moves=payload.moves,
@@ -1549,12 +1567,11 @@ async def finish_game(
 ) -> StoredGame:
     del _
     try:
-        if payload.deviceId is not None and payload.playerId is not None:
-            await game_store.assert_game_owner(
-                payload.deviceId,
-                payload.playerId,
-                game_id,
-            )
+        await game_store.assert_game_owner(
+            payload.deviceId,
+            payload.playerId,
+            game_id,
+        )
         stored = await game_store.finish_game(
             game_id,
             state=payload.state,
