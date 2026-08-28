@@ -855,8 +855,6 @@ function activateExperienceControl(): void {
     toggleSound()
   } else if (experienceFocusIndex.value === 1) {
     toggleMotion()
-  } else if (experienceFocusIndex.value === 2 && adaptiveProfile.value.adaptiveEnabled) {
-    void resetProfile(playerId.value)
   } else {
     closeExperiencePanel()
   }
@@ -1161,7 +1159,7 @@ function handleKeyDown(event: KeyboardEvent): void {
     if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') {
       experienceFocusIndex.value = Math.max(0, experienceFocusIndex.value - 1)
     } else if (event.key === 'ArrowDown' || event.key === 'ArrowRight') {
-      experienceFocusIndex.value = Math.min(3, experienceFocusIndex.value + 1)
+      experienceFocusIndex.value = Math.min(2, experienceFocusIndex.value + 1)
     } else if (event.key === 'Enter') {
       activateExperienceControl()
     } else if (event.key === 'Escape' || event.key === 'Backspace') {
@@ -1452,25 +1450,13 @@ onBeforeUnmount(() => {
             <strong>{{ experienceSettings.motionEnabled ? '开启' : '关闭' }}</strong>
           </button>
           <button
-            class="setting-control"
-            :class="{ 'setting-control--focused': inputState.mode === 'remote' && experienceFocusIndex === 2 }"
-            type="button"
-            :disabled="!adaptiveProfile.adaptiveEnabled"
-            @click="resetProfile(playerId)"
-          >
-            <span>重置水平</span>
-            <strong>{{ adaptiveProfile.ratedGames }} 盘</strong>
-          </button>
-          <button
             class="setting-control setting-control--close"
-            :class="{ 'setting-control--focused': inputState.mode === 'remote' && experienceFocusIndex === 3 }"
+            :class="{ 'setting-control--focused': inputState.mode === 'remote' && experienceFocusIndex === 2 }"
             type="button"
             @click="closeExperiencePanel"
           >
             <span>返回对局</span>
-            <strong>关闭</strong>
           </button>
-          <p v-if="adaptiveProfileError" class="adaptive-setting-error">{{ adaptiveProfileError }}</p>
           <p class="dialog-hint">方向键切换 · OK 修改 · BACK 返回</p>
         </div>
 
@@ -1866,13 +1852,6 @@ dd {
 .setting-control:disabled {
   cursor: default;
   opacity: 0.45;
-}
-
-.adaptive-setting-error {
-  margin: 0.8vh 0 0;
-  color: #d88674;
-  font-family: system-ui, sans-serif;
-  font-size: 0.85vw;
 }
 
 .setting-control--close {

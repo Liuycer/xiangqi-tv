@@ -622,6 +622,16 @@ class GameStore:
                 (client_game_id,),
             ).fetchone()
             if existing is None:
+                # Compatibility cleanup for clients that persisted the board
+                # before any move was played.
+                connection.execute(
+                    """
+                    DELETE FROM games
+                    WHERE player_id = ? AND state = 'active' AND ply_count = 0
+                      AND client_game_id <> ?
+                    """,
+                    (player_id, client_game_id),
+                )
                 connection.execute(
                     """
                     UPDATE games
@@ -1338,7 +1348,7 @@ class GameStore:
     ) -> dict[str, Any]:
         with self._connect() as connection:
             total = int(connection.execute(
-                "SELECT COUNT(*) FROM games WHERE player_id = ?",
+                "SELECT COUNT(*) FROM games WHERE player_id = ? AND ply_count > 0",
                 (player_id,),
             ).fetchone()[0])
             rows = connection.execute(
@@ -1350,7 +1360,7 @@ class GameStore:
                 FROM games AS g
                 LEFT JOIN analysis_jobs AS aj ON aj.game_id = g.id
                 LEFT JOIN move_analysis AS ma ON ma.game_id = g.id
-                WHERE g.player_id = ?
+                WHERE g.player_id = ? AND g.ply_count > 0
                 GROUP BY g.id
                 ORDER BY g.started_at DESC, g.id DESC
                 LIMIT ? OFFSET ?
@@ -1471,7 +1481,7 @@ class GameStore:
         undo_count: int,
         fallback_used: bool,
         settings_changed: bool,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         async with self.lock:
             return await asyncio.to_thread(
                 self._finish_game_sync,
@@ -1497,7 +1507,7 @@ class GameStore:
         undo_count: int,
         fallback_used: bool,
         settings_changed: bool,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         with self._connect() as connection:
             game = connection.execute(
                 "SELECT * FROM games WHERE id = ? OR client_game_id = ?",
@@ -1507,6 +1517,9 @@ class GameStore:
                 raise GameNotFound(game_id)
             if game["state"] == "active":
                 stored_id = str(game["id"])
+                if state == "abandoned" and not moves:
+                    connection.execute("DELETE FROM games WHERE id = ?", (stored_id,))
+                    return None
                 connection.execute("DELETE FROM game_moves WHERE game_id = ?", (stored_id,))
                 connection.executemany(
                     "INSERT INTO game_moves(game_id, ply, uci) VALUES (?, ?, ?)",
