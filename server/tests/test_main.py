@@ -4,6 +4,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.main import (
@@ -22,6 +23,8 @@ from app.main import (
     get_humanized_policy,
     get_side_to_move,
     select_humanized_line,
+    finish_game,
+    update_game_snapshot,
 )
 
 
@@ -89,6 +92,53 @@ class DeviceOwnershipRequestTests(unittest.TestCase):
                 result="draw",
                 termination="normal",
             )
+
+
+class GameWriteValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_snapshot_rejects_an_illegal_move_before_storage(self) -> None:
+        store = AsyncMock()
+        store.assert_game_owner = AsyncMock()
+        store.get_game_validation_context.return_value = {
+            "initialFen": INITIAL_FEN,
+            "state": "active",
+        }
+        payload = GameSnapshotRequest(
+            deviceId="device_12345678",
+            playerId="profile_12345678",
+            moves=["a9a8"],
+            currentPlayer="black",
+        )
+
+        with patch("app.main.game_store", store):
+            with self.assertRaises(HTTPException) as raised:
+                await update_game_snapshot("game-1", payload, None)
+
+        self.assertEqual(raised.exception.status_code, 422)
+        store.update_snapshot.assert_not_awaited()
+
+    async def test_finish_rejects_a_forged_nonterminal_result(self) -> None:
+        store = AsyncMock()
+        store.assert_game_owner = AsyncMock()
+        store.get_game_validation_context.return_value = {
+            "initialFen": INITIAL_FEN,
+            "state": "active",
+        }
+        payload = GameFinishRequest(
+            deviceId="device_12345678",
+            playerId="profile_12345678",
+            moves=["h2e2"],
+            currentPlayer="black",
+            state="completed",
+            result="red_win",
+            termination="checkmate",
+        )
+
+        with patch("app.main.game_store", store):
+            with self.assertRaises(HTTPException) as raised:
+                await finish_game("game-1", payload, None)
+
+        self.assertEqual(raised.exception.status_code, 422)
+        store.finish_game.assert_not_awaited()
 
 
 class PostGameAnalysisWorkerTests(unittest.IsolatedAsyncioTestCase):

@@ -738,6 +738,26 @@ class GameStore:
             assert updated is not None
             return self._row_to_game(updated)
 
+    async def get_game_validation_context(self, game_id: str) -> dict[str, Any]:
+        async with self.lock:
+            return await asyncio.to_thread(
+                self._get_game_validation_context_sync,
+                game_id,
+            )
+
+    def _get_game_validation_context_sync(self, game_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            game = connection.execute(
+                "SELECT initial_fen, state FROM games WHERE id = ? OR client_game_id = ?",
+                (game_id, game_id),
+            ).fetchone()
+            if game is None:
+                raise GameNotFound(game_id)
+            return {
+                "initialFen": game["initial_fen"],
+                "state": game["state"],
+            }
+
     async def claim_analysis_job(self) -> dict[str, Any] | None:
         async with self.lock:
             return await asyncio.to_thread(self._claim_analysis_job_sync)
