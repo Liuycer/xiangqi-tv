@@ -338,6 +338,8 @@ class GameFinishRequest(GameSnapshotRequest):
             raise ValueError("未完成对局的结果必须为 abandoned")
         if self.state == "completed" and self.result == "abandoned":
             raise ValueError("已完成对局不能使用 abandoned 结果")
+        if self.state == "completed" and not self.moves:
+            raise ValueError("没有走子的对局不能标记为已完成")
         return self
 
 
@@ -1213,7 +1215,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Xiangqi TV Engine API",
-    version="0.4.0",
+    version="0.4.1",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
@@ -1559,12 +1561,16 @@ async def update_game_snapshot(
     return StoredGame(**stored)
 
 
-@app.post("/v1/xiangqi/games/{game_id}/finish", response_model=StoredGame)
+@app.post(
+    "/v1/xiangqi/games/{game_id}/finish",
+    response_model=StoredGame,
+    responses={204: {"description": "未走子对局已丢弃"}},
+)
 async def finish_game(
     game_id: str,
     payload: GameFinishRequest,
     _: Annotated[None, Depends(require_api_token)],
-) -> StoredGame:
+) -> StoredGame | Response:
     del _
     try:
         await game_store.assert_game_owner(
@@ -1585,6 +1591,8 @@ async def finish_game(
         )
     except GameNotFound as error:
         raise HTTPException(status_code=404, detail="对局不存在") from error
+    if stored is None:
+        return Response(status_code=204)
     return StoredGame(**stored)
 
 

@@ -117,6 +117,93 @@ class ProfileStoreTests(unittest.IsolatedAsyncioTestCase):
                 "device_87654321", profile["profileId"], game["id"]
             )
 
+    async def test_untouched_games_are_hidden_and_discarded_when_abandoned(self) -> None:
+        profile = (await self.store.bootstrap_profiles("device_12345678", None))[0]
+        game = await self.store.create_game(
+            client_game_id="game_empty_12345678",
+            player_id=profile["profileId"],
+            mode="ai",
+            difficulty="adaptive",
+            ai_depth=3,
+            variation_seed=7,
+            adaptive_level=1,
+            initial_fen="initial",
+        )
+
+        history = await self.store.list_games(profile["profileId"], limit=20, offset=0)
+        self.assertEqual(history["total"], 0)
+        self.assertEqual(history["items"], [])
+
+        discarded = await self.store.finish_game(
+            game["id"],
+            state="abandoned",
+            result="abandoned",
+            termination="restart",
+            moves=[],
+            current_player="red",
+            undo_count=0,
+            fallback_used=False,
+            settings_changed=False,
+        )
+        self.assertIsNone(discarded)
+        with self.assertRaises(GameNotFound):
+            await self.store.get_game_detail(game["id"], profile["profileId"])
+
+    async def test_new_game_replaces_an_untouched_active_game_without_history(self) -> None:
+        profile = (await self.store.bootstrap_profiles("device_12345678", None))[0]
+        empty = await self.store.create_game(
+            client_game_id="game_empty_old_12345678",
+            player_id=profile["profileId"],
+            mode="ai",
+            difficulty="adaptive",
+            ai_depth=3,
+            variation_seed=7,
+            adaptive_level=1,
+            initial_fen="initial",
+        )
+        await self.store.create_game(
+            client_game_id="game_empty_new_12345678",
+            player_id=profile["profileId"],
+            mode="ai",
+            difficulty="adaptive",
+            ai_depth=3,
+            variation_seed=8,
+            adaptive_level=1,
+            initial_fen="initial",
+        )
+
+        with self.assertRaises(GameNotFound):
+            await self.store.get_game_detail(empty["id"], profile["profileId"])
+
+    async def test_abandoned_game_with_moves_remains_in_history(self) -> None:
+        profile = (await self.store.bootstrap_profiles("device_12345678", None))[0]
+        game = await self.store.create_game(
+            client_game_id="game_played_12345678",
+            player_id=profile["profileId"],
+            mode="ai",
+            difficulty="adaptive",
+            ai_depth=3,
+            variation_seed=7,
+            adaptive_level=1,
+            initial_fen="initial",
+        )
+        stored = await self.store.finish_game(
+            game["id"],
+            state="abandoned",
+            result="abandoned",
+            termination="restart",
+            moves=["a0a1"],
+            current_player="black",
+            undo_count=0,
+            fallback_used=False,
+            settings_changed=False,
+        )
+
+        self.assertIsNotNone(stored)
+        history = await self.store.list_games(profile["profileId"], limit=20, offset=0)
+        self.assertEqual(history["total"], 1)
+        self.assertEqual(history["items"][0]["plyCount"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

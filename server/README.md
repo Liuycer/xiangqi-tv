@@ -70,6 +70,11 @@ All profile-owned game, history and legacy adaptive endpoints require both
 changing data; clients that omit the device identity are intentionally rejected
 with HTTP 422 starting with API version 0.4.
 
+API version 0.4.1 does not retain untouched boards. The client delays `start`
+until the first move, an abandoned zero-ply game is deleted with HTTP 204, and
+history queries exclude any zero-ply rows left by older clients. Abandoned games
+with at least one move remain available for replay.
+
 ## Runtime configuration
 
 The systemd unit reads `/etc/xiangqi-engine-api.env`:

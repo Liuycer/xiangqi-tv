@@ -277,6 +277,7 @@ export function createClientGameId(): string {
 export class GameSyncClient {
   private readonly config: RemoteAiConfig
   private outbox: QueuedOperation[] = loadOperations()
+  private readonly pendingStarts = new Map<string, GameStartPayload>()
   private flushPromise: Promise<void> | null = null
 
   constructor(config: RemoteAiConfig = getDefaultRemoteAiConfig()) {
@@ -288,6 +289,17 @@ export class GameSyncClient {
   }
 
   start(payload: GameStartPayload): void {
+    // Opening the board is not yet a played game. Delay remote persistence
+    // until a move exists so untouched boards never enter history.
+    this.pendingStarts.set(payload.clientGameId, payload)
+  }
+
+  private enqueuePendingStart(gameId: string): void {
+    const payload = this.pendingStarts.get(gameId)
+    if (!payload) {
+      return
+    }
+    this.pendingStarts.delete(gameId)
     this.enqueue({
       id: createIdentifier('op'),
       gameId: payload.clientGameId,
@@ -299,6 +311,10 @@ export class GameSyncClient {
   }
 
   snapshot(gameId: string, payload: GameSnapshotPayload): void {
+    if (payload.moves.length === 0 && this.pendingStarts.has(gameId)) {
+      return
+    }
+    this.enqueuePendingStart(gameId)
     this.outbox = this.outbox.filter((operation) => (
       operation.gameId !== gameId || operation.kind !== 'snapshot'
     ))
@@ -313,6 +329,10 @@ export class GameSyncClient {
   }
 
   finish(gameId: string, payload: GameFinishPayload): void {
+    if (payload.moves.length === 0 && this.pendingStarts.delete(gameId)) {
+      return
+    }
+    this.enqueuePendingStart(gameId)
     this.outbox = this.outbox.filter((operation) => (
       operation.gameId !== gameId || operation.kind !== 'snapshot'
     ))

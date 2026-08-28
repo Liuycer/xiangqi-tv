@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { GameSyncClient } from './game-sync-client'
+import {
+  GameSyncClient,
+  type GameFinishPayload,
+  type GameSnapshotPayload,
+  type GameStartPayload,
+} from './game-sync-client'
 
 const OUTBOX_STORAGE_KEY = 'xiangqi-tv-game-outbox-v1'
 const FAILED_OUTBOX_STORAGE_KEY = 'xiangqi-tv-game-outbox-failed-v1'
@@ -67,6 +72,41 @@ function createClient(operations: ReadonlyArray<StoredOperation>): GameSyncClien
   })
 }
 
+function startPayload(gameId: string): GameStartPayload {
+  return {
+    clientGameId: gameId,
+    playerId: 'profile_12345678',
+    deviceId: 'device_12345678',
+    mode: 'ai',
+    difficulty: 'adaptive',
+    aiDepth: 3,
+    variationSeed: 7,
+    adaptiveLevel: 1,
+    initialFen: 'initial',
+  }
+}
+
+function snapshotPayload(moves: ReadonlyArray<string>): GameSnapshotPayload {
+  return {
+    deviceId: 'device_12345678',
+    playerId: 'profile_12345678',
+    moves,
+    currentPlayer: moves.length % 2 === 0 ? 'red' : 'black',
+    undoCount: 0,
+    fallbackUsed: false,
+    settingsChanged: false,
+  }
+}
+
+function finishPayload(moves: ReadonlyArray<string>): GameFinishPayload {
+  return {
+    ...snapshotPayload(moves),
+    state: 'abandoned',
+    result: 'abandoned',
+    termination: 'restart',
+  }
+}
+
 async function flushWithPacing(client: GameSyncClient): Promise<void> {
   const pending = client.flush()
   await vi.runAllTimersAsync()
@@ -85,6 +125,43 @@ afterEach(() => {
 })
 
 describe('game sync outbox', () => {
+  it('does not create or finish a game before the first move', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    const client = createClient([])
+
+    client.start(startPayload('game-empty'))
+    client.finish('game-empty', finishPayload([]))
+    await client.flush()
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(JSON.parse(localStorage.getItem(OUTBOX_STORAGE_KEY) ?? '[]')).toEqual([])
+  })
+
+  it('queues the start before the first non-empty snapshot', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 503 }))
+    const client = createClient([])
+
+    client.start(startPayload('game-played'))
+    client.snapshot('game-played', snapshotPayload(['a0a1']))
+    await client.flush()
+
+    const queued = JSON.parse(localStorage.getItem(OUTBOX_STORAGE_KEY) ?? '[]') as StoredOperation[]
+    expect(queued.map((item) => item.kind)).toEqual(['start', 'snapshot'])
+  })
+
+  it('keeps an empty finish after a previously recorded move for server cleanup', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 503 }))
+    const client = createClient([])
+
+    client.start(startPayload('game-undone'))
+    client.snapshot('game-undone', snapshotPayload(['a0a1']))
+    client.finish('game-undone', finishPayload([]))
+    await client.flush()
+
+    const queued = JSON.parse(localStorage.getItem(OUTBOX_STORAGE_KEY) ?? '[]') as StoredOperation[]
+    expect(queued.map((item) => item.kind)).toEqual(['start', 'finish'])
+  })
+
   it('quarantines a permanent 4xx game and continues with the next game', async () => {
     const rejectedStart = operation('op-rejected', 'game-rejected')
     const rejectedFinish = operation('op-dependent', 'game-rejected', 'finish')

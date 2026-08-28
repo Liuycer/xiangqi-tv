@@ -11,6 +11,7 @@ from app.main import (
     AdaptiveResetRequest,
     AnalysisLine,
     AnalysisRequest,
+    GameFinishRequest,
     GameSnapshotRequest,
     GameStartRequest,
     MAX_ANALYSIS_MULTIPV,
@@ -76,6 +77,18 @@ class DeviceOwnershipRequestTests(unittest.TestCase):
             parameters = schema["paths"][path]["get"]["parameters"]
             device = next(item for item in parameters if item["name"] == "deviceId")
             self.assertTrue(device["required"], path)
+
+    def test_completed_game_requires_at_least_one_move(self) -> None:
+        with self.assertRaises(ValidationError):
+            GameFinishRequest(
+                deviceId="device_12345678",
+                playerId="profile_12345678",
+                moves=[],
+                currentPlayer="red",
+                state="completed",
+                result="draw",
+                termination="normal",
+            )
 
 
 class PostGameAnalysisWorkerTests(unittest.IsolatedAsyncioTestCase):
