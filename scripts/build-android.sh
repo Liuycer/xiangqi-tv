@@ -12,6 +12,7 @@ if [ "${#XIANGQI_BUILD_API_TOKEN}" -lt 32 ]; then
 fi
 
 pnpm --dir "$PROJECT_DIR/web" build
+printf '%s\n' 'configured' > "$PROJECT_DIR/web/dist/.xiangqi-cloud-configured"
 
 cd "$PROJECT_DIR/android"
 ./gradlew assembleDebug

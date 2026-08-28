@@ -87,6 +87,25 @@ function submitEditor(): void {
   }
   editorOpen.value = false
 }
+
+function closeEditor(): boolean {
+  if (!editorOpen.value) return false
+  editorOpen.value = false
+  return true
+}
+
+function onEditorKeydown(event: KeyboardEvent): void {
+  const target = event.target
+  const isTextEntry = target instanceof HTMLInputElement
+    || target instanceof HTMLTextAreaElement
+    || (target instanceof HTMLElement && target.isContentEditable)
+  if (event.key === 'Escape' || (event.key === 'Backspace' && !isTextEntry)) {
+    event.preventDefault()
+    closeEditor()
+  }
+}
+
+defineExpose({ closeEditor, startCreate })
 </script>
 
 <template>
@@ -175,7 +194,11 @@ function submitEditor(): void {
     </section>
 
     <div v-if="editorOpen" class="profile-editor-overlay" role="presentation">
-      <form class="profile-editor" @submit.prevent="submitEditor">
+      <form
+        class="profile-editor"
+        @submit.prevent="submitEditor"
+        @keydown.stop="onEditorKeydown"
+      >
         <h3>{{ editingProfileId ? '编辑棋手' : '新建棋手' }}</h3>
         <label>
           <span>棋手名称</span>

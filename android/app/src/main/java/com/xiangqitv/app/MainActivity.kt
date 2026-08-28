@@ -2,6 +2,7 @@ package com.xiangqitv.app
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.net.Uri
 import android.os.Bundle
 import android.os.Build
@@ -9,6 +10,8 @@ import android.view.View
 import android.view.ViewGroup
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
+import android.webkit.JsResult
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -58,6 +61,38 @@ class MainActivity : Activity() {
             }
 
             webViewClient = LocalContentWebViewClient(assetLoader)
+            webChromeClient = object : WebChromeClient() {
+                override fun onJsConfirm(
+                    view: WebView,
+                    url: String,
+                    message: String,
+                    result: JsResult,
+                ): Boolean {
+                    val dialog = AlertDialog.Builder(this@MainActivity)
+                        .setMessage(message)
+                        .setPositiveButton("确定") { _, _ -> result.confirm() }
+                        .setNegativeButton("取消") { _, _ -> result.cancel() }
+                        .setOnCancelListener { result.cancel() }
+                        .create()
+                    dialog.show()
+                    return true
+                }
+
+                override fun onJsAlert(
+                    view: WebView,
+                    url: String,
+                    message: String,
+                    result: JsResult,
+                ): Boolean {
+                    AlertDialog.Builder(this@MainActivity)
+                        .setMessage(message)
+                        .setPositiveButton("确定") { _, _ -> result.confirm() }
+                        .setOnCancelListener { result.cancel() }
+                        .create()
+                        .show()
+                    return true
+                }
+            }
         }
 
         setContentView(webView)

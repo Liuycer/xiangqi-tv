@@ -144,7 +144,7 @@ android/app/build/outputs/apk/debug/app-debug.apk
 ./scripts/verify-apk.sh
 ```
 
-也可以在 Web 已构建后单独执行：
+只有在 `build-android.sh` 已生成带云端配置的 Web 产物和构建标记后，才可以单独重复执行 Gradle 构建：
 
 ```bash
 cd android
@@ -227,7 +227,7 @@ adb shell am start -n com.xiangqitv.app/.MainActivity
 
 ## 当前状态
 
-Phase 25–28 已完成 Profile 排位模式。SQLite schema v5 为棋手增加设备归属、名称、头像、软删除和最近使用时间，并能把旧玩家数据无损迁移为默认棋手。客户端冷启动先选择实际玩家，所有新请求使用 `deviceId + profileId` 核验数据归属；评级、历史、棋谱和 AI 复盘均按 Profile 隔离。原固定难度和自定义深度入口已移除，人机对局只使用 A0–A7 排位自适应。右侧对局信息已针对远距离观看放大，七项功能菜单完整保留在 1080P 电视安全区内。前端 76 项、服务端 24 项自动测试全部通过，最终 APK 已完成盒子鼠标与遥控器实机验证。
+Phase 25–28 已完成 Profile 排位模式。SQLite schema v5 为棋手增加设备归属、名称、头像、软删除和最近使用时间，并能把旧玩家数据无损迁移为默认棋手。客户端冷启动先选择实际玩家，所有新请求使用 `deviceId + profileId` 核验数据归属；评级、历史、棋谱和 AI 复盘均按 Profile 隔离。原固定难度和自定义深度入口已移除，人机对局只使用 A0–A7 排位自适应。右侧对局信息已针对远距离观看放大，七项功能菜单完整保留在 1080P 电视安全区内。历史列表已修复条目裁切，服务器 UTC 时间会稳定转换为北京时间，逐手评价使用中文标签；离线 outbox 按 VPS 限流节奏在后台补传，历史读取不再因积压队列出现 `Failed to fetch`。Android 构建会拒绝打包缺少云端配置的 Web 资源。前端 76 项、服务端 24 项自动测试全部通过，最终 APK 已完成盒子鼠标与遥控器实机验证。
 
 Phase 19–24 已完成云端对局生命周期、后台赛后分析、评级、自适应、历史回放和运维闭环。客户端通过本地 outbox 幂等同步开局、快照和终局；VPS 使用 SQLite WAL 保存棋局与逐手分析，Pikafish 后台任务会为实时走棋和局面分析让出引擎。服务提供受 Token 保护的历史、指标和 Profile 接口，并使用 systemd timer 每日在线备份数据库。生产环境为 `112.74.108.214`，域名 `823147.xyz` 通过 HTTPS 提供服务。
 

@@ -32,14 +32,22 @@ android {
 
 val webDistDirectory = rootProject.layout.projectDirectory.dir("../web/dist")
 val packagedWebAssets = layout.projectDirectory.dir("src/main/assets")
+val cloudConfigMarker = webDistDirectory.file(".xiangqi-cloud-configured")
 
 val syncWebAssets by tasks.registering(Sync::class) {
     from(webDistDirectory)
     into(packagedWebAssets)
+    exclude(".xiangqi-cloud-configured")
 
     doFirst {
         check(webDistDirectory.file("index.html").asFile.isFile) {
             "Web build not found. Run `pnpm --dir ../web build` before building Android."
+        }
+        check(
+            cloudConfigMarker.asFile.isFile &&
+                cloudConfigMarker.asFile.readText().trim() == "configured"
+        ) {
+            "Cloud configuration missing. Build with `VITE_XIANGQI_API_TOKEN=... ./scripts/build-android.sh`."
         }
     }
 }
