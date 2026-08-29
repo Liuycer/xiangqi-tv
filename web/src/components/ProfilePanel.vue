@@ -13,6 +13,8 @@ const props = defineProps<{
   required: boolean
   loading: boolean
   error: string | null
+  recoveryCode: string | null
+  recoveryBusy: boolean
 }>()
 
 const emit = defineEmits<{
@@ -22,6 +24,8 @@ const emit = defineEmits<{
   update: [profileId: string, displayName: string, avatarKey: ProfileAvatarKey]
   archive: [profileId: string]
   reset: [profileId: string]
+  generateRecovery: [profileId: string]
+  recover: [recoveryCode: string]
 }>()
 
 const avatarOptions: ReadonlyArray<{
@@ -41,6 +45,9 @@ const editorOpen = ref(false)
 const editingProfileId = ref<string | null>(null)
 const editorName = ref('')
 const editorAvatar = ref<ProfileAvatarKey>('general-red')
+const recoveryOpen = ref(false)
+const recoveryMode = ref<'show' | 'enter'>('enter')
+const recoveryInput = ref('')
 const selectedProfileId = ref<string | null>(props.activeProfileId ?? props.profiles[0]?.profileId ?? null)
 
 watch(() => props.activeProfileId, (value) => {
@@ -89,9 +96,33 @@ function submitEditor(): void {
 }
 
 function closeEditor(): boolean {
-  if (!editorOpen.value) return false
-  editorOpen.value = false
-  return true
+  if (editorOpen.value) {
+    editorOpen.value = false
+    return true
+  }
+  if (recoveryOpen.value) {
+    recoveryOpen.value = false
+    return true
+  }
+  return false
+}
+
+function showRecoveryCode(profileId: string): void {
+  recoveryMode.value = 'show'
+  recoveryOpen.value = true
+  emit('generateRecovery', profileId)
+}
+
+function startRecovery(): void {
+  recoveryMode.value = 'enter'
+  recoveryInput.value = ''
+  recoveryOpen.value = true
+}
+
+function submitRecovery(): void {
+  const code = recoveryInput.value.trim()
+  if (!code || props.recoveryBusy) return
+  emit('recover', code)
 }
 
 function onEditorKeydown(event: KeyboardEvent): void {
@@ -183,13 +214,22 @@ defineExpose({ closeEditor, startCreate })
               @click="emit('archive', selectedProfile.profileId)"
             >删除档案</button>
           </div>
+          <button
+            class="recovery-action"
+            type="button"
+            :disabled="recoveryBusy"
+            @click="showRecoveryCode(selectedProfile.profileId)"
+          >{{ recoveryBusy ? '正在生成…' : '生成档案恢复码' }}</button>
         </aside>
       </div>
 
       <p v-if="error" class="profile-error">{{ error }}</p>
       <footer>
         <span>鼠标单击选择 · 遥控器方向键移动 · OK 确认</span>
-        <button v-if="!required" type="button" @click="emit('close')">返回对局</button>
+        <div class="footer-actions">
+          <button type="button" @click="startRecovery">使用恢复码</button>
+          <button v-if="!required" type="button" @click="emit('close')">返回对局</button>
+        </div>
       </footer>
     </section>
 
@@ -218,6 +258,52 @@ defineExpose({ closeEditor, startCreate })
           <button type="button" @click="editorOpen = false">取消</button>
           <button class="primary-action" type="submit" :disabled="!editorName.trim()">保存</button>
         </div>
+      </form>
+    </div>
+
+    <div
+      v-if="recoveryOpen"
+      class="profile-editor-overlay recovery-editor-overlay"
+      role="presentation"
+    >
+      <form
+        class="profile-editor recovery-editor"
+        @submit.prevent="recoveryMode === 'enter' ? submitRecovery() : (recoveryOpen = false)"
+        @keydown.stop="onEditorKeydown"
+      >
+        <template v-if="recoveryMode === 'show'">
+          <h3>保存档案恢复码</h3>
+          <p>更换设备或清除应用数据后，可用它找回该棋手的段位、历史与分析。</p>
+          <output class="recovery-code">{{ recoveryCode ?? (recoveryBusy ? '正在生成…' : '生成失败，请重试') }}</output>
+          <p class="recovery-warning">恢复码只显示这一次、使用后立即失效。请拍照或抄写，并妥善保管。</p>
+          <div class="editor-actions">
+            <button class="primary-action" type="submit">我已保存</button>
+          </div>
+        </template>
+        <template v-else>
+          <h3>使用恢复码</h3>
+          <p>输入旧设备生成的恢复码。恢复成功后，完整档案会转移到这台设备。</p>
+          <label>
+            <span>档案恢复码</span>
+            <input
+              v-model="recoveryInput"
+              maxlength="32"
+              autocomplete="off"
+              autocapitalize="characters"
+              placeholder="XQ-XXXX-XXXX-XXXX-XXXX"
+              autofocus
+            />
+          </label>
+          <p class="recovery-warning">这是一次性转移操作；旧设备将不再拥有该档案。</p>
+          <div class="editor-actions">
+            <button type="button" @click="recoveryOpen = false">取消</button>
+            <button
+              class="primary-action"
+              type="submit"
+              :disabled="!recoveryInput.trim() || recoveryBusy"
+            >{{ recoveryBusy ? '正在恢复…' : '恢复档案' }}</button>
+          </div>
+        </template>
       </form>
     </div>
   </div>
@@ -296,11 +382,14 @@ button { font: inherit; cursor: pointer; }
 button:disabled { opacity: .42; cursor: default; }
 .primary-action { width: 100%; padding: 13px 18px; border: 0; border-radius: 12px; color: #321306; background: linear-gradient(135deg, #f0d27b, #d89b37); font-weight: 800; }
 .detail-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
-.detail-actions button, footer button, .editor-actions > button { padding: 10px; color: #e5d2ac; border: 1px solid rgba(230, 190, 105, .3); border-radius: 10px; background: transparent; }
+.detail-actions button, footer button, .editor-actions > button, .recovery-action { padding: 10px; color: #e5d2ac; border: 1px solid rgba(230, 190, 105, .3); border-radius: 10px; background: transparent; }
+.recovery-action { width: 100%; margin-top: 8px; }
 .profile-error { color: #ffad97; margin: 14px 0 0; }
 .profile-state { min-height: 34vh; display: grid; place-items: center; color: #d1bd95; font-size: 24px; }
 footer { justify-content: space-between; gap: 18px; margin-top: 22px; color: #a99779; }
+.footer-actions { display: flex; gap: 10px; }
 .profile-editor-overlay { z-index: 90; background: rgba(3, 2, 1, .78); }
+.recovery-editor-overlay { place-items: start center; padding-top: 7vh; }
 .profile-editor { width: min(560px, 82vw); padding: 28px; border: 2px solid #bd8b3c; border-radius: 22px; color: #f5e5c2; background: #24160f; }
 .profile-editor h3 { margin: 0 0 20px; font-size: 30px; }
 .profile-editor label { display: grid; gap: 8px; }
@@ -310,11 +399,21 @@ footer { justify-content: space-between; gap: 18px; margin-top: 22px; color: #a9
 .avatar-picker .avatar-option--selected { border-color: #ffefad; box-shadow: 0 0 0 3px #a72c1c; }
 .editor-actions { justify-content: flex-end; gap: 10px; }
 .editor-actions .primary-action { width: auto; min-width: 120px; color: #321306; }
+.recovery-editor p { color: #c9b48d; line-height: 1.55; }
+.recovery-code { display: block; margin: 18px 0; padding: 18px 12px; border: 1px solid rgba(240, 199, 100, .5); border-radius: 12px; color: #ffe294; background: rgba(0, 0, 0, .25); font: 800 clamp(20px, 2vw, 30px) ui-monospace, monospace; text-align: center; letter-spacing: .06em; }
+.recovery-warning { color: #f0a68d !important; }
 
 @media (max-height: 760px) {
   .profile-dialog { padding: 18px 24px; }
   .profile-intro { margin-bottom: 12px; }
   .profile-card { min-height: 82px; }
-  footer { margin-top: 12px; }
+  .profile-detail { padding: 14px; }
+  .profile-detail > strong { margin: 4px 0 10px; }
+  .profile-detail dl { margin-bottom: 10px; }
+  .profile-detail dl div { padding: 5px 0; }
+  .primary-action { padding: 10px 14px; }
+  .detail-actions button, footer button, .recovery-action { padding: 7px; }
+  .recovery-action { margin-top: 4px; }
+  footer { margin-top: 8px; }
 }
 </style>

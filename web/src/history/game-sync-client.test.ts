@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   GameSyncClient,
+  loadSyncFailures,
   type GameFinishPayload,
   type GameSnapshotPayload,
   type GameStartPayload,
@@ -180,6 +181,83 @@ describe('game sync outbox', () => {
       expect.objectContaining({ id: 'op-rejected', status: 422 }),
       expect.objectContaining({ id: 'op-dependent', status: 424 }),
     ])
+    expect(loadSyncFailures()).toEqual([
+      expect.objectContaining({
+        gameId: 'game-rejected',
+        status: 422,
+        operationCount: 2,
+        kinds: ['start', 'finish'],
+      }),
+    ])
+  })
+
+  it('lists failed games without exposing payloads and clears one game at a time', () => {
+    localStorage.setItem(FAILED_OUTBOX_STORAGE_KEY, JSON.stringify([
+      { ...operation('op-a', 'game-a'), failedAt: '2026-08-28T10:00:00Z', status: 422 },
+      { ...operation('op-a2', 'game-a', 'finish'), failedAt: '2026-08-28T10:00:00Z', status: 424 },
+      { ...operation('op-b', 'game-b'), failedAt: '2026-08-28T11:00:00Z', status: 409 },
+    ]))
+    const client = createClient([])
+
+    expect(client.getSyncFailures().map((failure) => failure.gameId)).toEqual([
+      'game-b',
+      'game-a',
+    ])
+    expect(client.clearSyncFailures('game-b')).toEqual([
+      expect.objectContaining({ gameId: 'game-a', operationCount: 2 }),
+    ])
+    expect(client.clearSyncFailures()).toEqual([])
+    expect(localStorage.getItem(FAILED_OUTBOX_STORAGE_KEY)).toBeNull()
+  })
+
+  it('generates and consumes a profile recovery code through the cloud API', async () => {
+    const profile = {
+      playerId: 'profile_12345678',
+      profileId: 'profile_12345678',
+      deviceId: 'device_new_12345',
+      displayName: '小明',
+      avatarKey: 'horse',
+      createdAt: '2026-08-28 10:00:00',
+      lastActiveAt: '2026-08-28 11:00:00',
+      rating: 1234,
+      recommendedLevel: 2,
+      recommendedCode: 'A2',
+      recommendedLabel: '普通',
+      recommendedDepth: 3,
+      currentLevel: 2,
+      currentCode: 'A2',
+      currentLabel: '普通',
+      currentDepth: 3,
+      cloudEnabled: true,
+      humanize: true,
+      humanizeStyle: 'moderate',
+      locked: false,
+      gamesUntilAdjustment: 2,
+      ratedGames: 8,
+      shadowMode: false,
+      adaptiveEnabled: true,
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        recoveryCode: 'XQ-2345-6789-ABCD-EFGH',
+        createdAt: '2026-08-28 11:00:00',
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(profile), { status: 200 }))
+    const client = createClient([])
+
+    const generated = await client.generateProfileRecoveryCode(
+      'device_12345678',
+      'profile_12345678',
+    )
+    const recovered = await client.recoverProfile(
+      'device_new_12345',
+      generated.recoveryCode,
+    )
+
+    expect(generated.recoveryCode).toBe('XQ-2345-6789-ABCD-EFGH')
+    expect(recovered.profileId).toBe('profile_12345678')
+    expect(fetchMock.mock.calls[0]?.[0]).toContain('/profiles/profile_12345678/recovery-code')
+    expect(fetchMock.mock.calls[1]?.[0]).toContain('/profiles/recover')
   })
 
   it.each([401, 403, 408, 425, 429, 500, 503])(

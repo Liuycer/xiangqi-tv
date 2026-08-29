@@ -96,6 +96,89 @@ class ProfileStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reset["rating"], 1050)
         self.assertEqual(reset["currentLevel"], 1)
 
+    async def test_one_time_recovery_code_transfers_complete_profile(self) -> None:
+        profile = (await self.store.bootstrap_profiles("device_12345678", None))[0]
+        generated = await self.store.generate_profile_recovery_code(
+            "device_12345678",
+            profile["profileId"],
+        )
+
+        self.assertRegex(
+            generated["recoveryCode"],
+            r"^XQ-[23456789A-HJ-NP-Z]{4}(?:-[23456789A-HJ-NP-Z]{4}){3}$",
+        )
+        recovered = await self.store.recover_profile(
+            "device_87654321",
+            generated["recoveryCode"].lower().replace("-", " "),
+        )
+
+        self.assertEqual(recovered["profileId"], profile["profileId"])
+        self.assertEqual(recovered["deviceId"], "device_87654321")
+        self.assertEqual(recovered["rating"], profile["rating"])
+        with self.assertRaises(ProfileNotFound):
+            await self.store.assert_profile_owner(
+                "device_12345678",
+                profile["profileId"],
+            )
+        with self.assertRaises(ProfileNotFound):
+            await self.store.recover_profile(
+                "device_third_1234",
+                generated["recoveryCode"],
+            )
+
+    async def test_generating_a_new_recovery_code_invalidates_the_old_one(self) -> None:
+        profile = (await self.store.bootstrap_profiles("device_12345678", None))[0]
+        first = await self.store.generate_profile_recovery_code(
+            "device_12345678", profile["profileId"]
+        )
+        second = await self.store.generate_profile_recovery_code(
+            "device_12345678", profile["profileId"]
+        )
+
+        self.assertNotEqual(first["recoveryCode"], second["recoveryCode"])
+        with self.assertRaises(ProfileNotFound):
+            await self.store.recover_profile("device_87654321", first["recoveryCode"])
+        recovered = await self.store.recover_profile(
+            "device_87654321", second["recoveryCode"]
+        )
+        self.assertEqual(recovered["profileId"], profile["profileId"])
+
+    async def test_recovery_respects_target_device_profile_limit(self) -> None:
+        source = (await self.store.bootstrap_profiles("device_source_123", None))[0]
+        generated = await self.store.generate_profile_recovery_code(
+            "device_source_123", source["profileId"]
+        )
+        await self.store.bootstrap_profiles("device_target_123", None)
+        for index in range(5):
+            await self.store.create_profile(
+                "device_target_123", f"棋手{index}", "horse"
+            )
+
+        with self.assertRaises(ProfileLimitReached):
+            await self.store.recover_profile(
+                "device_target_123", generated["recoveryCode"]
+            )
+        await self.store.assert_profile_owner(
+            "device_source_123", source["profileId"]
+        )
+
+    async def test_archiving_a_profile_invalidates_its_recovery_code(self) -> None:
+        profiles = await self.store.bootstrap_profiles("device_12345678", None)
+        archived = await self.store.create_profile(
+            "device_12345678", "待删除", "advisor"
+        )
+        generated = await self.store.generate_profile_recovery_code(
+            "device_12345678", archived["profileId"]
+        )
+
+        await self.store.archive_profile("device_12345678", archived["profileId"])
+
+        self.assertEqual(len(profiles), 1)
+        with self.assertRaises(ProfileNotFound):
+            await self.store.recover_profile(
+                "device_87654321", generated["recoveryCode"]
+            )
+
     async def test_game_ownership_requires_the_matching_device_and_profile(self) -> None:
         profile = (await self.store.bootstrap_profiles("device_12345678", None))[0]
         game = await self.store.create_game(

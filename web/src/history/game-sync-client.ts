@@ -143,6 +143,19 @@ interface FailedOperation extends QueuedOperation {
   readonly status: number
 }
 
+export interface SyncFailureSummary {
+  readonly gameId: string
+  readonly failedAt: string
+  readonly status: number
+  readonly operationCount: number
+  readonly kinds: ReadonlyArray<QueuedOperation['kind']>
+}
+
+export interface ProfileRecoveryCode {
+  readonly recoveryCode: string
+  readonly createdAt: string
+}
+
 function createIdentifier(prefix: string): string {
   const values = new Uint32Array(4)
   globalThis.crypto.getRandomValues(values)
@@ -172,6 +185,66 @@ function saveOperations(operations: ReadonlyArray<QueuedOperation>): void {
     localStorage.setItem(OUTBOX_STORAGE_KEY, JSON.stringify(operations.slice(-100)))
   } catch {
     // A storage failure must never block the board interaction path.
+  }
+}
+
+function loadFailedOperations(): FailedOperation[] {
+  try {
+    const parsed: unknown = JSON.parse(
+      localStorage.getItem(FAILED_OUTBOX_STORAGE_KEY) ?? '[]',
+    )
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((item): item is FailedOperation => (
+      typeof item === 'object'
+      && item !== null
+      && typeof (item as FailedOperation).id === 'string'
+      && typeof (item as FailedOperation).gameId === 'string'
+      && ['start', 'snapshot', 'finish'].includes((item as FailedOperation).kind)
+      && typeof (item as FailedOperation).failedAt === 'string'
+      && Number.isInteger((item as FailedOperation).status)
+    )).slice(-MAX_FAILED_OPERATIONS)
+  } catch {
+    return []
+  }
+}
+
+export function loadSyncFailures(): ReadonlyArray<SyncFailureSummary> {
+  const grouped = new Map<string, FailedOperation[]>()
+  for (const operation of loadFailedOperations()) {
+    grouped.set(operation.gameId, [...(grouped.get(operation.gameId) ?? []), operation])
+  }
+  return Array.from(grouped, ([gameId, operations]): SyncFailureSummary => {
+    const primary = operations.find((operation) => operation.status !== 424) ?? operations[0]
+    const failedAt = operations.reduce(
+      (latest, operation) => operation.failedAt > latest ? operation.failedAt : latest,
+      '',
+    )
+    return Object.freeze({
+      gameId,
+      failedAt,
+      status: primary?.status ?? 0,
+      operationCount: operations.length,
+      kinds: Object.freeze(Array.from(new Set(operations.map((operation) => operation.kind)))),
+    })
+  }).sort((first, second) => second.failedAt.localeCompare(first.failedAt))
+}
+
+export function clearSyncFailures(gameId?: string): void {
+  try {
+    if (!gameId) {
+      localStorage.removeItem(FAILED_OUTBOX_STORAGE_KEY)
+      return
+    }
+    const remaining = loadFailedOperations().filter(
+      (operation) => operation.gameId !== gameId,
+    )
+    if (remaining.length === 0) {
+      localStorage.removeItem(FAILED_OUTBOX_STORAGE_KEY)
+    } else {
+      localStorage.setItem(FAILED_OUTBOX_STORAGE_KEY, JSON.stringify(remaining))
+    }
+  } catch {
+    // Diagnostics cleanup must not affect normal gameplay.
   }
 }
 
@@ -413,6 +486,43 @@ export class GameSyncClient {
     return this.parseAdaptiveProfile(payload)
   }
 
+  async generateProfileRecoveryCode(
+    deviceId: string,
+    profileId: string,
+  ): Promise<ProfileRecoveryCode> {
+    const payload = await this.requestJson(
+      'POST',
+      `/v1/xiangqi/profiles/${encodeURIComponent(profileId)}/recovery-code`,
+      { deviceId },
+    )
+    if (
+      typeof payload !== 'object'
+      || payload === null
+      || typeof (payload as ProfileRecoveryCode).recoveryCode !== 'string'
+      || typeof (payload as ProfileRecoveryCode).createdAt !== 'string'
+    ) {
+      throw new Error('恢复码返回格式无效')
+    }
+    return payload as ProfileRecoveryCode
+  }
+
+  async recoverProfile(deviceId: string, recoveryCode: string): Promise<AdaptiveProfile> {
+    const payload = await this.requestJson('POST', '/v1/xiangqi/profiles/recover', {
+      deviceId,
+      recoveryCode,
+    })
+    return this.parseAdaptiveProfile(payload)
+  }
+
+  getSyncFailures(): ReadonlyArray<SyncFailureSummary> {
+    return loadSyncFailures()
+  }
+
+  clearSyncFailures(gameId?: string): ReadonlyArray<SyncFailureSummary> {
+    clearSyncFailures(gameId)
+    return loadSyncFailures()
+  }
+
   async setAdaptiveLock(
     deviceId: string,
     playerId: string,
@@ -498,7 +608,14 @@ export class GameSyncClient {
         signal: controller.signal,
       })
       if (!response.ok) {
-        throw new Error(`自适应服务请求失败：HTTP ${response.status}`)
+        let detail = ''
+        try {
+          const errorPayload = await response.json() as { detail?: unknown }
+          if (typeof errorPayload.detail === 'string') detail = `：${errorPayload.detail}`
+        } catch {
+          // Some proxy errors intentionally have no JSON body.
+        }
+        throw new Error(`云端服务请求失败：HTTP ${response.status}${detail}`)
       }
       if (response.status === 204) return null
       return await response.json() as unknown
