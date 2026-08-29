@@ -2,7 +2,7 @@
 
 面向天猫魔盒 Q8 畅越版的中国象棋电视游戏。棋盘、规则、交互和本地回退 AI 运行在电视盒子上；排位自适应、Pikafish 走棋、局面分析、历史对局与赛后复盘由云端服务完成。客户端采用 Vue 3 + TypeScript，并由一个尽可能薄的 Kotlin WebView 壳打包为 Android APK。
 
-当前进度：Phase 25–35 已完成开发。游戏以真人棋手 Profile 为核心运行排位自适应模式；Phase 29–34 完成可靠性、历史与规则加固，Phase 35 增加同步失败管理和一次性档案恢复码。
+当前进度：Phase 25–36 已完成开发。游戏以真人棋手 Profile 为核心运行排位自适应模式；Phase 29–35 完成可靠性、历史与档案恢复，Phase 36 按中国象棋协会 2020 规则增加攻击性循环裁定。
 
 ## 已验证目标设备
 
@@ -55,7 +55,7 @@ UI → InputController → GameController → RuleEngine / GameState / AIEngine
 
 ## 核心功能
 
-- 严格中国象棋规则：合法着生成、将军/将死/困毙、重复局面和禁止反复长将。
+- 中国象棋协会规则核心：合法着生成、将军/将死/困毙、重复局面、长将、长杀、长捉及混合攻击性循环。
 - 棋手 Profile：冷启动选择实际玩家，每台设备最多 6 个独立档案，支持新建、改名、头像、切换、重置和软删除。
 - 排位自适应：客户端不再提供固定难度选单；每个 Profile 独立保存排位分、A0–A7 段位和调整进度。
 - 云端 AI：普通对局、三路候选局面分析和赛后逐手复盘由 2C2G VPS 上的 Pikafish 执行；断网时安全回退到本地 AI。
@@ -217,6 +217,8 @@ adb shell am start -n com.xiangqitv.app/.MainActivity
 服务端棋谱与终局校验见 [Phase 34 服务端规则校验报告](docs/phase-34-server-game-validation.md)。
 
 同步诊断与档案恢复见 [Phase 35 同步与恢复报告](docs/phase-35-sync-profile-recovery.md)。
+
+中规循环裁定见 [Phase 36 中国象棋协会循环规则报告](docs/phase-36-cxa-repetition.md)。
 
 ## 操作方式
 

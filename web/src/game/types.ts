@@ -35,6 +35,7 @@ export type GamePhase =
   | 'checkmate'
   | 'stalemate'
   | 'perpetual-check'
+  | 'prohibited-repetition'
   | 'repetition-draw'
 
 export interface GameStatus {
@@ -42,4 +43,9 @@ export interface GameStatus {
   readonly checkedPlayer: Player | null
   readonly winner: Player | null
   readonly offender?: Player
+  readonly repetitionViolation?:
+    | 'perpetual-check'
+    | 'perpetual-kill'
+    | 'perpetual-chase'
+    | 'mixed-prohibited'
 }

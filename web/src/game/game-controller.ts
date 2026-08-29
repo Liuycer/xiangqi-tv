@@ -3,10 +3,10 @@ import { formatMoveNotation } from './notation'
 import {
   adjudicateRepetition,
   createInitialPositionEntry,
-  createPositionKey,
+  createPositionEntry,
   type PositionHistoryEntry,
 } from './repetition-adjudicator'
-import { applyMove, getGameStatus, getLegalMoves, getOpponent, isInCheck } from './rule-engine'
+import { applyMove, getGameStatus, getLegalMoves, getOpponent } from './rule-engine'
 import type { BoardState, GameStatus, Move, Player, Square } from './types'
 
 export interface MoveRecord {
@@ -186,13 +186,12 @@ export class GameController {
       move,
     }))
     this.currentPlayer = getOpponent(this.currentPlayer)
-    this.positionHistory.push(Object.freeze({
-      key: createPositionKey(this.board, this.currentPlayer),
-      sideToMove: this.currentPlayer,
+    this.positionHistory.push(createPositionEntry(
+      this.board,
+      this.currentPlayer,
       move,
-      mover: movingPiece.player,
-      givesCheck: isInCheck(this.board, this.currentPlayer),
-    }))
+      movingPiece.player,
+    ))
     this.status = this.evaluateStatus()
     this.selectedSquare = null
     this.legalMoves = []
@@ -214,6 +213,15 @@ export class GameController {
         checkedPlayer: null,
         winner: repetition.winner,
         offender: repetition.offender,
+      }
+    }
+    if (repetition.type === 'prohibited-repetition') {
+      return {
+        phase: 'prohibited-repetition',
+        checkedPlayer: null,
+        winner: repetition.winner,
+        offender: repetition.offender,
+        repetitionViolation: repetition.violation,
       }
     }
     return {
