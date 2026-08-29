@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   GameSyncClient,
   loadSyncFailures,
+  mergeGameHistoryItems,
   type GameFinishPayload,
+  type GameHistorySummary,
   type GameSnapshotPayload,
   type GameStartPayload,
 } from './game-sync-client'
@@ -126,6 +128,25 @@ afterEach(() => {
 })
 
 describe('game sync outbox', () => {
+  it('requests a later history page and merges it without duplicate games', async () => {
+    const page = {
+      total: 25,
+      offset: 20,
+      items: [{ id: 'game-21' }, { id: 'game-22' }, { id: 'game-22' }],
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify(page), { status: 200 }),
+    )
+    const client = createClient([])
+
+    const loaded = await client.getGameHistory('device_12345678', 'profile_12345678', 20)
+    const existing = [{ id: 'game-20' }, { id: 'game-21' }] as GameHistorySummary[]
+    const merged = mergeGameHistoryItems(existing, loaded.items)
+
+    expect(fetchMock.mock.calls[0]?.[0]).toContain('limit=20&offset=20')
+    expect(merged.map((item) => item.id)).toEqual(['game-20', 'game-21', 'game-22'])
+  })
+
   it('does not create or finish a game before the first move', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
     const client = createClient([])

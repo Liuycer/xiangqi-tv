@@ -31,6 +31,7 @@ import {
   loadCachedProfiles,
   loadOrCreateDeviceId,
   loadOrCreatePlayerId,
+  mergeGameHistoryItems,
   saveActiveProfileId,
   saveCachedProfiles,
   type AdaptiveProfile,
@@ -120,8 +121,11 @@ const analysisPreset = ref<AnalysisPresetKey>('standard')
 const analysisFocusIndex = ref(1)
 const historyOpen = ref(false)
 const historyLoading = ref(false)
+const historyLoadingMore = ref(false)
 const historyError = ref<string | null>(null)
 const historyItems = ref<ReadonlyArray<GameHistorySummary>>([])
+const historyTotal = ref(0)
+const historyNextOffset = ref(0)
 const historyDetail = ref<GameHistoryDetail | null>(null)
 const historySelectedGameId = ref<string | null>(null)
 const historyReplayPly = ref(0)
@@ -134,6 +138,7 @@ const soundController = new SoundController(experienceSettings.value.soundEnable
 let aiGeneration = 0
 let analysisGeneration = 0
 let historyGeneration = 0
+let historySelectionTimer: ReturnType<typeof globalThis.setTimeout> | null = null
 let gameVariationSeed = createGameVariationSeed()
 let openingPreference = advanceOpeningPreference()
 let previousOpeningMove = loadPreviousOpeningMove()
@@ -173,6 +178,7 @@ const recentMoveRecords = computed<ReadonlyArray<MoveRecord>>(() => (
 const inputModeLabel = computed(() => (inputState.value.mode === 'mouse' ? '鼠标' : '遥控器'))
 const gameModeLabel = computed(() => (gameMode.value === 'local' ? '本地双人' : '人机对战'))
 const analysisConfigured = computed(() => remoteAiClient.isConfigured())
+const historyHasMore = computed(() => historyNextOffset.value < historyTotal.value)
 const analysisVisibleCandidateRank = computed(() => {
   if (analysisOpen.value) {
     if (inputState.value.mode === 'remote' && analysisFocusIndex.value >= 5) {
@@ -720,14 +726,19 @@ function resetViewportScroll(): void {
 
 function closeHistoryPanel(): void {
   historyGeneration += 1
+  cancelPendingHistorySelection()
   historyOpen.value = false
   historyLoading.value = false
+  historyLoadingMore.value = false
 }
 
 async function loadGameHistory(): Promise<void> {
   const generation = historyGeneration + 1
   historyGeneration = generation
   historyLoading.value = true
+  historyLoadingMore.value = false
+  historyTotal.value = 0
+  historyNextOffset.value = 0
   historyError.value = null
   try {
     // Pending offline writes are drained in the background. History reads must
@@ -736,6 +747,8 @@ async function loadGameHistory(): Promise<void> {
     const page = await gameSyncClient.getGameHistory(deviceId, playerId.value)
     if (generation !== historyGeneration || !historyOpen.value) return
     historyItems.value = page.items
+    historyTotal.value = page.total
+    historyNextOffset.value = page.offset + page.items.length
     const preferred = page.items.some((item) => item.id === historySelectedGameId.value)
       ? historySelectedGameId.value
       : page.items[0]?.id ?? null
@@ -757,6 +770,46 @@ async function loadGameHistory(): Promise<void> {
   } finally {
     syncFailures.value = gameSyncClient.getSyncFailures()
     if (generation === historyGeneration) historyLoading.value = false
+  }
+}
+
+async function loadMoreGameHistory(selectFirstNew = false): Promise<void> {
+  if (historyLoading.value || historyLoadingMore.value || !historyHasMore.value) return
+  cancelPendingHistorySelection()
+  const generation = historyGeneration
+  const previousLength = historyItems.value.length
+  const requestedOffset = historyNextOffset.value
+  historyLoadingMore.value = true
+  historyError.value = null
+  try {
+    const page = await gameSyncClient.getGameHistory(
+      deviceId,
+      playerId.value,
+      requestedOffset,
+    )
+    if (generation !== historyGeneration || !historyOpen.value) return
+    historyItems.value = mergeGameHistoryItems(historyItems.value, page.items)
+    historyTotal.value = page.total
+    historyNextOffset.value = Math.max(
+      historyNextOffset.value,
+      page.offset + page.items.length,
+    )
+    if (page.items.length === 0) {
+      historyTotal.value = historyNextOffset.value
+    }
+    if (selectFirstNew) {
+      const firstNew = historyItems.value[previousLength]
+      if (firstNew) {
+        historyFocusIndex.value = previousLength + 1
+        await loadGameHistoryDetail(firstNew.id, generation)
+      }
+    }
+  } catch (error) {
+    if (generation === historyGeneration && historyOpen.value) {
+      historyError.value = error instanceof Error ? error.message : '读取更多历史对局失败'
+    }
+  } finally {
+    if (generation === historyGeneration) historyLoadingMore.value = false
   }
 }
 
@@ -783,11 +836,28 @@ async function loadGameHistoryDetail(gameId: string, generation = historyGenerat
   }
 }
 
-function selectHistoryGame(gameId: string): void {
+function cancelPendingHistorySelection(): void {
+  if (historySelectionTimer === null) return
+  globalThis.clearTimeout(historySelectionTimer)
+  historySelectionTimer = null
+}
+
+function selectHistoryGame(gameId: string, deferred = false): void {
   const index = historyItems.value.findIndex((item) => item.id === gameId)
   if (index >= 0) historyFocusIndex.value = index + 1
+  historySelectedGameId.value = gameId
+  historyDetail.value = null
+  historyReplayPly.value = 0
   historyError.value = null
-  void loadGameHistoryDetail(gameId)
+  cancelPendingHistorySelection()
+  if (!deferred) {
+    void loadGameHistoryDetail(gameId)
+    return
+  }
+  historySelectionTimer = globalThis.setTimeout(() => {
+    historySelectionTimer = null
+    void loadGameHistoryDetail(gameId)
+  }, 300)
 }
 
 function replayPreviousMove(): void {
@@ -1132,27 +1202,46 @@ function handleKeyDown(event: KeyboardEvent): void {
   if (historyOpen.value) {
     let handled = true
     const itemCount = historyItems.value.length
+    const loadMoreIndex = historyHasMore.value ? itemCount + 1 : -1
+    const previousIndex = itemCount + (historyHasMore.value ? 2 : 1)
+    const nextIndex = previousIndex + 1
     if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
       if (itemCount > 0) {
-        const offset = event.key === 'ArrowUp' ? -1 : 1
-        const current = Math.min(Math.max(historyFocusIndex.value - 1, 0), itemCount - 1)
-        const next = Math.min(Math.max(current + offset, 0), itemCount - 1)
-        const item = historyItems.value[next]
-        historyFocusIndex.value = next + 1
-        if (item && item.id !== historySelectedGameId.value) selectHistoryGame(item.id)
+        if (historyFocusIndex.value === loadMoreIndex) {
+          if (event.key === 'ArrowUp') {
+            const item = historyItems.value[itemCount - 1]
+            if (item) selectHistoryGame(item.id, true)
+          }
+        } else if (historyFocusIndex.value >= 1 && historyFocusIndex.value <= itemCount) {
+          const current = historyFocusIndex.value - 1
+          if (event.key === 'ArrowDown' && current === itemCount - 1 && historyHasMore.value) {
+            cancelPendingHistorySelection()
+            historyFocusIndex.value = loadMoreIndex
+          } else {
+            const offset = event.key === 'ArrowUp' ? -1 : 1
+            const next = Math.min(Math.max(current + offset, 0), itemCount - 1)
+            const item = historyItems.value[next]
+            if (item && item.id !== historySelectedGameId.value) selectHistoryGame(item.id, true)
+          }
+        } else {
+          const item = historyItems.value[itemCount - 1]
+          if (item) selectHistoryGame(item.id, true)
+        }
       }
     } else if (event.key === 'ArrowLeft') {
-      historyFocusIndex.value = itemCount + 1
+      historyFocusIndex.value = previousIndex
       replayPreviousMove()
     } else if (event.key === 'ArrowRight') {
-      historyFocusIndex.value = itemCount + 2
+      historyFocusIndex.value = nextIndex
       replayNextMove()
     } else if (event.key === 'Enter') {
       if (historyFocusIndex.value === 0) {
         closeHistoryPanel()
-      } else if (historyFocusIndex.value === itemCount + 1) {
+      } else if (historyFocusIndex.value === loadMoreIndex) {
+        void loadMoreGameHistory(true)
+      } else if (historyFocusIndex.value === previousIndex) {
         replayPreviousMove()
-      } else if (historyFocusIndex.value === itemCount + 2) {
+      } else if (historyFocusIndex.value === nextIndex) {
         replayNextMove()
       } else {
         const item = historyItems.value[historyFocusIndex.value - 1]
@@ -1297,6 +1386,7 @@ onBeforeUnmount(() => {
   delete window.__xiangqiHandleBack
   aiClient.dispose()
   cancelAnalysisRequest(false)
+  cancelPendingHistorySelection()
   remoteAiClient.dispose()
   soundController.dispose()
 })
@@ -1591,6 +1681,9 @@ onBeforeUnmount(() => {
       :replay="historyReplay"
       :replay-ply="historyReplayPly"
       :loading="historyLoading"
+      :loading-more="historyLoadingMore"
+      :has-more="historyHasMore"
+      :total="historyTotal"
       :error="historyError"
       :focus-index="historyFocusIndex"
       :sync-failures="syncFailures"
@@ -1598,6 +1691,7 @@ onBeforeUnmount(() => {
       @select="selectHistoryGame"
       @previous="replayPreviousMove"
       @next="replayNextMove"
+      @load-more="loadMoreGameHistory()"
       @clear-failures="clearSyncFailure"
     />
   </main>

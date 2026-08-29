@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { nextTick, ref, watch } from 'vue'
 
 import ChessBoard from './ChessBoard.vue'
 import type {
@@ -18,6 +18,9 @@ const props = defineProps<{
   replay: ReplayPosition
   replayPly: number
   loading: boolean
+  loadingMore: boolean
+  hasMore: boolean
+  total: number
   error: string | null
   focusIndex: number
   syncFailures: ReadonlyArray<SyncFailureSummary>
@@ -28,10 +31,19 @@ const emit = defineEmits<{
   select: [gameId: string]
   previous: []
   next: []
+  loadMore: []
   clearFailures: [gameId: string | null]
 }>()
 
 const failureOpen = ref(false)
+const listRef = ref<HTMLElement | null>(null)
+
+watch(() => props.focusIndex, async () => {
+  if (props.inputMode !== 'remote') return
+  await nextTick()
+  listRef.value?.querySelector<HTMLElement>('.control--focused')
+    ?.scrollIntoView({ block: 'nearest' })
+})
 
 function formatDate(value: string): string {
   // SQLite CURRENT_TIMESTAMP is UTC but is returned without a zone suffix.
@@ -135,7 +147,7 @@ function operationLabel(failure: SyncFailureSummary): string {
       <div v-else-if="items.length === 0" class="history-message">还没有可显示的历史对局。</div>
 
       <div v-else class="history-layout">
-        <aside class="history-list" aria-label="对局列表">
+        <aside ref="listRef" class="history-list" aria-label="对局列表">
           <button
             v-for="(item, index) in items"
             :key="item.id"
@@ -154,6 +166,16 @@ function operationLabel(failure: SyncFailureSummary): string {
             <small>{{ difficultyLabel(item) }} · {{ item.plyCount }} 手</small>
             <small>{{ analysisLabel(item) }}</small>
           </button>
+          <button
+            v-if="hasMore"
+            type="button"
+            class="history-load-more"
+            :class="{
+              'control--focused': inputMode === 'remote' && focusIndex === items.length + 1,
+            }"
+            :disabled="loading || loadingMore"
+            @click="emit('loadMore')"
+          >{{ loadingMore ? '正在加载…' : `加载更多（${items.length} / ${total}）` }}</button>
         </aside>
 
         <section class="replay-area" aria-label="对局回放">
@@ -182,14 +204,14 @@ function operationLabel(failure: SyncFailureSummary): string {
                 <button
                   type="button"
                   :disabled="replayPly <= 0"
-                  :class="{ 'control--focused': inputMode === 'remote' && focusIndex === items.length + 1 }"
+                  :class="{ 'control--focused': inputMode === 'remote' && focusIndex === items.length + (hasMore ? 2 : 1) }"
                   @click="emit('previous')"
                 >上一手</button>
                 <strong>{{ replay.appliedPly }} / {{ detail.moves.length }}</strong>
                 <button
                   type="button"
                   :disabled="replayPly >= detail.moves.length"
-                  :class="{ 'control--focused': inputMode === 'remote' && focusIndex === items.length + 2 }"
+                  :class="{ 'control--focused': inputMode === 'remote' && focusIndex === items.length + (hasMore ? 3 : 2) }"
                   @click="emit('next')"
                 >下一手</button>
               </div>
@@ -334,6 +356,16 @@ function operationLabel(failure: SyncFailureSummary): string {
 .history-item-heading > strong { color: #d7bd91; font-size: 1.05vw; }
 .history-item small { color: #aa9477; font-size: 0.78vw; line-height: 1.35; }
 .history-item--selected { border-color: #e1ad58; background: rgba(84, 54, 29, 0.94); }
+.history-load-more {
+  flex: 0 0 auto;
+  min-height: 6.5vh;
+  border: 2px solid rgba(201, 157, 94, 0.5);
+  background: rgba(74, 48, 28, 0.92);
+  color: #e6c98f;
+  font-size: 0.9vw;
+  cursor: pointer;
+}
+.history-load-more:disabled { opacity: 0.6; cursor: default; }
 
 .replay-area {
   display: grid;
