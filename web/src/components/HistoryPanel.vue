@@ -1,8 +1,11 @@
 <script setup lang="ts">
+import { ref } from 'vue'
+
 import ChessBoard from './ChessBoard.vue'
 import type {
   GameHistoryDetail,
   GameHistorySummary,
+  SyncFailureSummary,
 } from '../history/game-sync-client'
 import type { ReplayPosition } from '../history/history-replay'
 import type { InputMode } from '../input/types'
@@ -17,6 +20,7 @@ const props = defineProps<{
   loading: boolean
   error: string | null
   focusIndex: number
+  syncFailures: ReadonlyArray<SyncFailureSummary>
 }>()
 
 const emit = defineEmits<{
@@ -24,7 +28,10 @@ const emit = defineEmits<{
   select: [gameId: string]
   previous: []
   next: []
+  clearFailures: [gameId: string | null]
 }>()
+
+const failureOpen = ref(false)
 
 function formatDate(value: string): string {
   // SQLite CURRENT_TIMESTAMP is UTC but is returned without a zone suffix.
@@ -92,6 +99,11 @@ function classificationLabel(value: string | null | undefined): string {
   }
   return labels[value] ?? value
 }
+
+function operationLabel(failure: SyncFailureSummary): string {
+  const labels = { start: '创建', snapshot: '快照', finish: '结束' } as const
+  return failure.kinds.map((kind) => labels[kind]).join('、')
+}
 </script>
 
 <template>
@@ -102,12 +114,20 @@ function classificationLabel(value: string | null | undefined): string {
           <p>GAME ARCHIVE</p>
           <h2>历史对局</h2>
         </div>
-        <button
-          type="button"
-          class="close-button"
-          :class="{ 'control--focused': inputMode === 'remote' && focusIndex === 0 }"
-          @click="emit('close')"
-        >关闭</button>
+        <div class="heading-actions">
+          <button
+            v-if="syncFailures.length"
+            type="button"
+            class="sync-warning-button"
+            @click="failureOpen = true"
+          >同步异常 {{ syncFailures.length }}</button>
+          <button
+            type="button"
+            class="close-button"
+            :class="{ 'control--focused': inputMode === 'remote' && focusIndex === 0 }"
+            @click="emit('close')"
+          >关闭</button>
+        </div>
       </header>
 
       <div v-if="loading && items.length === 0" class="history-message">正在读取服务器对局记录…</div>
@@ -195,6 +215,42 @@ function classificationLabel(value: string | null | undefined): string {
       <p v-if="error && items.length" class="inline-error">{{ error }}</p>
       <p class="history-hint">遥控器：↑↓选择对局，←→回放，BACK 关闭 · 鼠标：点击对局和回放按钮</p>
     </section>
+
+    <div
+      v-if="failureOpen && syncFailures.length"
+      class="failure-overlay"
+      role="presentation"
+      @click.self="failureOpen = false"
+      @keydown.stop
+    >
+      <section class="failure-dialog" role="dialog" aria-modal="true" aria-label="同步异常记录">
+        <header>
+          <div>
+            <p>SYNC DIAGNOSTICS</p>
+            <h3>未保存到服务器的对局</h3>
+          </div>
+          <button type="button" @click="failureOpen = false">返回历史</button>
+        </header>
+        <p class="failure-intro">这些请求已被服务器确定拒绝，因此不会自动重试。这里只保存诊断信息，不影响后续新对局。</p>
+        <div class="failure-list">
+          <article v-for="failure in syncFailures" :key="failure.gameId">
+            <div>
+              <strong>HTTP {{ failure.status }} · {{ operationLabel(failure) }}</strong>
+              <span>{{ formatDate(failure.failedAt) }} · {{ failure.operationCount }} 项操作</span>
+              <small>{{ failure.gameId }}</small>
+            </div>
+            <button type="button" @click="emit('clearFailures', failure.gameId)">删除记录</button>
+          </article>
+        </div>
+        <footer>
+          <span>删除只清理本机诊断记录，无法补传已经被拒绝的棋局。</span>
+          <button
+            type="button"
+            @click="emit('clearFailures', null)"
+          >清空全部</button>
+        </footer>
+      </section>
+    </div>
   </div>
 </template>
 
@@ -233,6 +289,7 @@ function classificationLabel(value: string | null | undefined): string {
 .history-heading h2 { margin: 0; }
 .history-heading p { color: #a77a49; font-size: 0.85vw; letter-spacing: 0.35em; }
 .history-heading h2 { margin-top: 0.5vh; font-size: 2.15vw; }
+.heading-actions { display: flex; align-items: center; gap: .8vw; }
 
 .close-button,
 .replay-controls button {
@@ -242,6 +299,7 @@ function classificationLabel(value: string | null | undefined): string {
   cursor: pointer;
 }
 .close-button { min-width: 7vw; padding: 1vh 1.4vw; font-size: 1vw; }
+.sync-warning-button { padding: 1vh 1.2vw; border: 2px solid #b65b42; color: #ffd1bd; background: #4a2118; font-size: 1vw; cursor: pointer; }
 
 .history-layout {
   display: grid;
@@ -307,6 +365,23 @@ function classificationLabel(value: string | null | undefined): string {
 .inline-error { margin: 0.4vh 0; text-align: center; font-size: 0.85vw; }
 .history-hint { margin: 0.8vh 0 0; color: #8f7b65; text-align: center; font-size: 0.8vw; }
 
+.failure-overlay { position: fixed; z-index: 145; inset: 0; display: grid; place-items: center; background: rgba(4, 2, 1, .82); }
+.failure-dialog { box-sizing: border-box; width: min(76vw, 1180px); max-height: 82vh; padding: 2.2vw; overflow: auto; border: 2px solid #9f573e; border-radius: 22px; color: #ecd29d; background: #291811; box-shadow: 0 24px 70px rgba(0,0,0,.65); }
+.failure-dialog header, .failure-dialog footer, .failure-list article { display: flex; align-items: center; justify-content: space-between; gap: 1.2vw; }
+.failure-dialog header p, .failure-dialog header h3 { margin: 0; }
+.failure-dialog header p { color: #c77d61; letter-spacing: .2em; }
+.failure-dialog header h3 { margin-top: .5vh; font-size: 2vw; }
+.failure-dialog button { padding: .9vh 1vw; border: 1px solid rgba(231,173,122,.45); border-radius: 8px; color: #f0d2a6; background: rgba(0,0,0,.18); cursor: pointer; }
+.failure-intro { color: #bea487; line-height: 1.55; }
+.failure-list { display: grid; gap: .8vh; margin: 2vh 0; }
+.failure-list article { padding: 1.2vh 1vw; border: 1px solid rgba(190,111,82,.35); background: rgba(0,0,0,.15); }
+.failure-list article > div { display: grid; gap: .35vh; min-width: 0; }
+.failure-list strong { color: #f2b59c; font-size: 1.05vw; }
+.failure-list span { color: #bda58b; }
+.failure-list small { overflow: hidden; color: #806e60; font-family: ui-monospace, monospace; text-overflow: ellipsis; }
+.failure-dialog footer { padding-top: 1.4vh; border-top: 1px solid rgba(255,255,255,.1); color: #a58f78; }
+.failure-dialog footer button { color: #ffc0a6; border-color: #a64e37; }
+
 @media (min-width: 1921px) {
   .history-heading p { font-size: 17px; }
   .history-heading h2 { font-size: 43px; }
@@ -315,5 +390,6 @@ function classificationLabel(value: string | null | undefined): string {
   .history-item small, .history-hint, .inline-error { font-size: 16px; }
   .replay-summary strong { font-size: 30px; }
   .replay-moves li { font-size: 18px; }
+  .sync-warning-button, .failure-list strong { font-size: 20px; }
 }
 </style>

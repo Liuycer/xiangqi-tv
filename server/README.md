@@ -82,6 +82,12 @@ flying generals, repetition and perpetual-check termination. Finished records
 are accepted only when `currentPlayer`, result and termination agree with the
 replayed terminal position; abandoned nonterminal records remain valid.
 
+API version 0.6.0 adds one-time Profile recovery codes. An owning device may
+generate an 80-bit human-readable code; only its SHA-256 digest is stored. The
+code transfers the complete active Profile to a new device and is consumed in
+the same transaction. Generating a replacement or archiving the Profile
+invalidates older codes, and the destination still obeys the six-Profile limit.
+
 ## Runtime configuration
 
 The systemd unit reads `/etc/xiangqi-engine-api.env`:

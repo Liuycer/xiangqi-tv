@@ -23,6 +23,7 @@ from .game_store import (
     ProfileLimitReached,
     ProfileNotFound,
     SCHEMA_VERSION,
+    normalize_recovery_code,
 )
 from .xiangqi_rules import (
     IllegalPosition,
@@ -468,6 +469,21 @@ class ProfileUpdateRequest(BaseModel):
 
 class ProfileOwnerRequest(BaseModel):
     deviceId: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class ProfileRecoveryRequest(BaseModel):
+    deviceId: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    recoveryCode: str = Field(min_length=16, max_length=32)
+
+    @field_validator("recoveryCode")
+    @classmethod
+    def recovery_code_is_valid(cls, value: str) -> str:
+        return normalize_recovery_code(value)
+
+
+class ProfileRecoveryCodeResponse(BaseModel):
+    recoveryCode: str
+    createdAt: str
 
 
 class ProfileListResponse(BaseModel):
@@ -1234,7 +1250,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Xiangqi TV Engine API",
-    version="0.5.0",
+    version="0.6.0",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
@@ -1460,6 +1476,44 @@ async def reset_profile(
     except ProfileNotFound as error:
         raise HTTPException(status_code=404, detail="棋手档案不存在") from error
     profile = await game_store.reset_player_rating(profile_id)
+    return adaptive_response(profile)
+
+
+@app.post(
+    "/v1/xiangqi/profiles/{profile_id}/recovery-code",
+    response_model=ProfileRecoveryCodeResponse,
+)
+async def generate_profile_recovery_code(
+    profile_id: str,
+    payload: ProfileOwnerRequest,
+    _: Annotated[None, Depends(require_api_token)],
+) -> ProfileRecoveryCodeResponse:
+    del _
+    try:
+        generated = await game_store.generate_profile_recovery_code(
+            payload.deviceId,
+            profile_id,
+        )
+    except ProfileNotFound as error:
+        raise HTTPException(status_code=404, detail="棋手档案不存在") from error
+    return ProfileRecoveryCodeResponse(**generated)
+
+
+@app.post("/v1/xiangqi/profiles/recover", response_model=AdaptiveProfileResponse)
+async def recover_profile(
+    payload: ProfileRecoveryRequest,
+    _: Annotated[None, Depends(require_api_token)],
+) -> AdaptiveProfileResponse:
+    del _
+    try:
+        profile = await game_store.recover_profile(
+            payload.deviceId,
+            payload.recoveryCode,
+        )
+    except ProfileNotFound as error:
+        raise HTTPException(status_code=404, detail="恢复码无效或已经使用") from error
+    except ProfileLimitReached as error:
+        raise HTTPException(status_code=409, detail="当前设备最多只能保留 6 个棋手档案") from error
     return adaptive_response(profile)
 
 

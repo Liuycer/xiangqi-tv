@@ -38,6 +38,7 @@ import {
   type GameHistoryDetail,
   type GameHistorySummary,
   type ProfileAvatarKey,
+  type SyncFailureSummary,
 } from '../history/game-sync-client'
 import { buildReplayPosition } from '../history/history-replay'
 import { InputController } from '../input/input-controller'
@@ -125,6 +126,9 @@ const historyDetail = ref<GameHistoryDetail | null>(null)
 const historySelectedGameId = ref<string | null>(null)
 const historyReplayPly = ref(0)
 const historyFocusIndex = ref(1)
+const syncFailures = ref<ReadonlyArray<SyncFailureSummary>>(gameSyncClient.getSyncFailures())
+const profileRecoveryCode = ref<string | null>(null)
+const profileRecoveryBusy = ref(false)
 const profilePanelRef = ref<InstanceType<typeof ProfilePanel> | null>(null)
 const soundController = new SoundController(experienceSettings.value.soundEnabled)
 let aiGeneration = 0
@@ -609,6 +613,39 @@ async function resetProfile(profileId: string): Promise<void> {
   }
 }
 
+async function generateProfileRecoveryCode(profileId: string): Promise<void> {
+  profileRecoveryBusy.value = true
+  profileRecoveryCode.value = null
+  profileError.value = null
+  try {
+    const generated = await gameSyncClient.generateProfileRecoveryCode(deviceId, profileId)
+    profileRecoveryCode.value = generated.recoveryCode
+  } catch (error) {
+    profileError.value = error instanceof Error ? error.message : '生成档案恢复码失败'
+  } finally {
+    profileRecoveryBusy.value = false
+  }
+}
+
+async function recoverProfile(recoveryCode: string): Promise<void> {
+  profileRecoveryBusy.value = true
+  profileError.value = null
+  try {
+    const recovered = await gameSyncClient.recoverProfile(deviceId, recoveryCode)
+    profiles.value = [
+      recovered,
+      ...profiles.value.filter((profile) => profile.profileId !== recovered.profileId),
+    ]
+    saveCachedProfiles(profiles.value)
+    profileFocusIndex.value = 0
+    profilePanelRef.value?.closeEditor()
+  } catch (error) {
+    profileError.value = error instanceof Error ? error.message : '恢复棋手档案失败'
+  } finally {
+    profileRecoveryBusy.value = false
+  }
+}
+
 function openExperiencePanel(): void {
   closeAnalysisPanel()
   closeHistoryPanel()
@@ -657,6 +694,7 @@ function openHistoryPanel(): void {
   historyOpen.value = true
   historyFocusIndex.value = 1
   historyError.value = null
+  syncFailures.value = gameSyncClient.getSyncFailures()
   syncState()
   void loadGameHistory()
 }
@@ -703,8 +741,13 @@ async function loadGameHistory(): Promise<void> {
       historyError.value = error instanceof Error ? error.message : '读取历史对局失败'
     }
   } finally {
+    syncFailures.value = gameSyncClient.getSyncFailures()
     if (generation === historyGeneration) historyLoading.value = false
   }
+}
+
+function clearSyncFailure(gameId: string | null): void {
+  syncFailures.value = gameSyncClient.clearSyncFailures(gameId ?? undefined)
 }
 
 async function loadGameHistoryDetail(gameId: string, generation = historyGeneration): Promise<void> {
@@ -1496,12 +1539,16 @@ onBeforeUnmount(() => {
       :required="profileRequired"
       :loading="profileLoading"
       :error="profileError"
+      :recovery-code="profileRecoveryCode"
+      :recovery-busy="profileRecoveryBusy"
       @close="closeProfilePanel"
       @select="selectProfile"
       @create="createProfile"
       @update="updateProfile"
       @archive="archiveProfile"
       @reset="resetProfile"
+      @generate-recovery="generateProfileRecoveryCode"
+      @recover="recoverProfile"
     />
 
     <AnalysisPanel
@@ -1532,10 +1579,12 @@ onBeforeUnmount(() => {
       :loading="historyLoading"
       :error="historyError"
       :focus-index="historyFocusIndex"
+      :sync-failures="syncFailures"
       @close="closeHistoryPanel"
       @select="selectHistoryGame"
       @previous="replayPreviousMove"
       @next="replayNextMove"
+      @clear-failures="clearSyncFailure"
     />
   </main>
 </template>

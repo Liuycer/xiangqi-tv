@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
+import secrets
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -10,8 +12,9 @@ from typing import Any, Literal
 
 
 GameState = Literal["active", "completed", "abandoned"]
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 MAX_ACTIVE_PROFILES = 6
+RECOVERY_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,20 @@ class ProfileNotFound(RuntimeError):
 
 class ProfileLimitReached(RuntimeError):
     pass
+
+
+def normalize_recovery_code(value: str) -> str:
+    compact = value.upper().replace("-", "").replace(" ", "")
+    if len(compact) == 18 and compact.startswith("XQ"):
+        compact = compact[2:]
+    if len(compact) != 16 or any(char not in RECOVERY_CODE_ALPHABET for char in compact):
+        raise ValueError("恢复码格式无效")
+    return "XQ-" + "-".join(compact[index : index + 4] for index in range(0, 16, 4))
+
+
+def _recovery_code_hash(value: str) -> str:
+    normalized = normalize_recovery_code(value)
+    return hashlib.sha256(f"xiangqi-profile-recovery-v1:{normalized}".encode()).hexdigest()
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -247,6 +264,13 @@ class GameStore:
                 "TEXT NOT NULL DEFAULT 'general-red'",
             )
             self._ensure_column(connection, "players", "archived_at", "TEXT")
+            self._ensure_column(connection, "players", "recovery_code_hash", "TEXT")
+            self._ensure_column(
+                connection,
+                "players",
+                "recovery_code_created_at",
+                "TEXT",
+            )
             self._ensure_column(
                 connection,
                 "players",
@@ -263,6 +287,10 @@ class GameStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS players_device_idx "
                 "ON players(device_id, archived_at, last_active_at DESC)"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS players_recovery_code_idx "
+                "ON players(recovery_code_hash) WHERE recovery_code_hash IS NOT NULL"
             )
             self._ensure_column(
                 connection,
@@ -518,11 +546,100 @@ class GameStore:
             connection.execute(
                 """
                 UPDATE players
-                SET archived_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                SET archived_at = CURRENT_TIMESTAMP, recovery_code_hash = NULL,
+                    recovery_code_created_at = NULL, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
                 (profile_id,),
             )
+
+    async def generate_profile_recovery_code(
+        self,
+        device_id: str,
+        profile_id: str,
+    ) -> dict[str, str]:
+        async with self.lock:
+            return await asyncio.to_thread(
+                self._generate_profile_recovery_code_sync,
+                device_id,
+                profile_id,
+            )
+
+    def _generate_profile_recovery_code_sync(
+        self,
+        device_id: str,
+        profile_id: str,
+    ) -> dict[str, str]:
+        with self._connect() as connection:
+            self._owned_profile(connection, device_id, profile_id)
+            compact = "".join(secrets.choice(RECOVERY_CODE_ALPHABET) for _ in range(16))
+            code = normalize_recovery_code(compact)
+            connection.execute(
+                """
+                UPDATE players
+                SET recovery_code_hash = ?, recovery_code_created_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (_recovery_code_hash(code), profile_id),
+            )
+            created_at = connection.execute(
+                "SELECT recovery_code_created_at FROM players WHERE id = ?",
+                (profile_id,),
+            ).fetchone()
+            assert created_at is not None
+            return {"recoveryCode": code, "createdAt": str(created_at[0])}
+
+    async def recover_profile(
+        self,
+        device_id: str,
+        recovery_code: str,
+    ) -> dict[str, Any]:
+        async with self.lock:
+            return await asyncio.to_thread(
+                self._recover_profile_sync,
+                device_id,
+                recovery_code,
+            )
+
+    def _recover_profile_sync(
+        self,
+        device_id: str,
+        recovery_code: str,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            player = connection.execute(
+                """
+                SELECT * FROM players
+                WHERE recovery_code_hash = ? AND archived_at IS NULL
+                """,
+                (_recovery_code_hash(recovery_code),),
+            ).fetchone()
+            if player is None:
+                raise ProfileNotFound("invalid_recovery_code")
+            if player["device_id"] != device_id:
+                count = int(connection.execute(
+                    """
+                    SELECT COUNT(*) FROM players
+                    WHERE device_id = ? AND archived_at IS NULL
+                    """,
+                    (device_id,),
+                ).fetchone()[0])
+                if count >= MAX_ACTIVE_PROFILES:
+                    raise ProfileLimitReached(device_id)
+            profile_id = str(player["id"])
+            connection.execute(
+                """
+                UPDATE players
+                SET device_id = ?, recovery_code_hash = NULL,
+                    recovery_code_created_at = NULL,
+                    last_active_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (device_id, profile_id),
+            )
+            return self._get_player_profile_sync(connection, profile_id)
 
     async def assert_profile_owner(self, device_id: str, profile_id: str) -> None:
         async with self.lock:
