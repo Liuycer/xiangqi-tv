@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 
@@ -20,6 +20,7 @@ GamePhase = Literal[
     "checkmate",
     "stalemate",
     "perpetual-check",
+    "prohibited-repetition",
     "repetition-draw",
 ]
 
@@ -43,6 +44,7 @@ class IllegalPosition(ValueError):
 class Piece:
     player: Player
     kind: PieceKind
+    uid: int = field(default=0, compare=False)
 
 
 Board = tuple[tuple[Piece | None, ...], ...]
@@ -61,6 +63,8 @@ class ReplayResult:
 @dataclass(frozen=True)
 class _HistoryEntry:
     key: str
+    board: Board
+    move: tuple[tuple[int, int], tuple[int, int]] | None
     mover: Player | None
     gives_check: bool
 
@@ -75,6 +79,7 @@ def parse_fen(fen: str) -> tuple[Board, Player]:
         raise IllegalPosition("FEN 格式无效")
 
     rows: list[tuple[Piece | None, ...]] = []
+    piece_uid = 1
     for rank in fields[0].split("/"):
         row: list[Piece | None] = []
         for symbol in rank:
@@ -85,7 +90,8 @@ def parse_fen(fen: str) -> tuple[Board, Player]:
             if kind is None:
                 raise IllegalPosition("FEN 棋子字符无效")
             player: Player = "red" if symbol.isupper() else "black"
-            row.append(Piece(player, kind))
+            row.append(Piece(player, kind, piece_uid))
+            piece_uid += 1
         if len(row) != 9:
             raise IllegalPosition("FEN 每行必须包含 9 个交叉点")
         rows.append(tuple(row))
@@ -107,10 +113,18 @@ def parse_fen(fen: str) -> tuple[Board, Player]:
 def validate_replay(fen: str, moves: list[str]) -> ReplayResult:
     board, current_player = parse_fen(fen)
     phase, winner = _board_status(board, current_player)
-    history = [_HistoryEntry(_position_key(board, current_player), None, False)]
+    history = [
+        _HistoryEntry(_position_key(board, current_player), board, None, None, False)
+    ]
 
     for ply, uci in enumerate(moves, start=1):
-        if phase in {"checkmate", "stalemate", "perpetual-check", "repetition-draw"}:
+        if phase in {
+            "checkmate",
+            "stalemate",
+            "perpetual-check",
+            "prohibited-repetition",
+            "repetition-draw",
+        }:
             raise IllegalPosition(f"第 {ply} 手发生在对局已经结束之后")
         try:
             start, end = _parse_uci(uci)
@@ -124,7 +138,13 @@ def validate_replay(fen: str, moves: list[str]) -> ReplayResult:
         current_player = opponent(current_player)
         gives_check = _is_in_check(board, current_player)
         history.append(
-            _HistoryEntry(_position_key(board, current_player), mover, gives_check)
+            _HistoryEntry(
+                _position_key(board, current_player),
+                board,
+                (start, end),
+                mover,
+                gives_check,
+            )
         )
 
         repetition = _adjudicate_repetition(history)
@@ -135,7 +155,7 @@ def validate_replay(fen: str, moves: list[str]) -> ReplayResult:
             phase, winner = _board_status(board, current_player)
 
     offender: Player | None = None
-    if phase == "perpetual-check":
+    if phase in {"perpetual-check", "prohibited-repetition"}:
         repetition = _adjudicate_repetition(history)
         offender = repetition[1] if repetition else None
     return ReplayResult(
@@ -177,6 +197,7 @@ def validate_finished_game(
         "checkmate": "checkmate",
         "stalemate": "stalemate",
         "perpetual-check": "perpetual-check",
+        "prohibited-repetition": "prohibited-repetition",
         "repetition-draw": "repetition_draw",
     }.get(replay.phase)
     if expected_termination is None:
@@ -410,18 +431,208 @@ def _position_key(board: Board, current_player: Player) -> str:
     return f"{current_player}|{placement}"
 
 
+_PIECE_CLASS_VALUE: dict[PieceKind, int] = {
+    "general": 100,
+    "rook": 4,
+    "cannon": 2,
+    "horse": 2,
+    "advisor": 1,
+    "elephant": 1,
+    "soldier": 1,
+}
+
+
+def _all_legal_moves(
+    board: Board,
+    player: Player,
+) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    moves: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    for start_row in range(10):
+        for start_col in range(9):
+            piece = board[start_row][start_col]
+            if piece is None or piece.player != player:
+                continue
+            for end_row in range(10):
+                for end_col in range(9):
+                    start = (start_row, start_col)
+                    end = (end_row, end_col)
+                    if _is_legal_move(board, player, start, end):
+                        moves.append((start, end))
+    return moves
+
+
+def _legal_captures(
+    board: Board,
+    player: Player,
+) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    return [
+        move
+        for move in _all_legal_moves(board, player)
+        if board[move[1][0]][move[1][1]] is not None
+    ]
+
+
+def _piece_crossed_river(piece: Piece, row: int) -> bool:
+    return row <= 4 if piece.player == "red" else row >= 5
+
+
+def _collect_chase_threats(
+    board: Board,
+    attacker: Player,
+) -> dict[int, tuple[PieceKind, bool, frozenset[int]]]:
+    grouped: dict[int, tuple[PieceKind, bool, set[int]]] = {}
+    for start, end in _legal_captures(board, attacker):
+        attacking_piece = board[start[0]][start[1]]
+        victim = board[end[0]][end[1]]
+        if attacking_piece is None or victim is None:
+            continue
+        if attacking_piece.kind in {"general", "soldier"}:
+            continue
+        if victim.kind == "soldier" and not _piece_crossed_river(victim, end[0]):
+            continue
+
+        captured_board = _apply_move(board, start, end)
+        recaptures = []
+        for reply_start, reply_end in _legal_captures(captured_board, victim.player):
+            reply_victim = captured_board[reply_end[0]][reply_end[1]]
+            if reply_victim is not None and reply_victim.uid == attacking_piece.uid:
+                recaptures.append((reply_start, reply_end))
+        rooted = bool(recaptures)
+        if rooted and _PIECE_CLASS_VALUE[victim.kind] <= _PIECE_CLASS_VALUE[attacking_piece.kind]:
+            continue
+
+        existing = grouped.get(victim.uid)
+        if existing is None:
+            grouped[victim.uid] = (victim.kind, rooted, {attacking_piece.uid})
+        else:
+            kind, all_rooted, attackers = existing
+            attackers.add(attacking_piece.uid)
+            grouped[victim.uid] = (kind, all_rooted and rooted, attackers)
+
+    return {
+        uid: (kind, rooted, frozenset(attackers))
+        for uid, (kind, rooted, attackers) in grouped.items()
+    }
+
+
+def _creates_chase(before: Board, after: Board, mover: Player) -> bool:
+    before_victims = set(_collect_chase_threats(before, mover))
+    return any(
+        victim not in before_victims
+        for victim in _collect_chase_threats(after, mover)
+    )
+
+
+def _checking_moves(
+    board: Board,
+    attacker: Player,
+) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    defender = opponent(attacker)
+    return [
+        move
+        for move in _all_legal_moves(board, attacker)
+        if _is_in_check(_apply_move(board, *move), defender)
+    ]
+
+
+def _can_force_mate_by_checks(
+    board: Board,
+    attacker: Player,
+    attacker_turns_left: int = 3,
+) -> bool:
+    if attacker_turns_left <= 0:
+        return False
+    defender = opponent(attacker)
+    for move in _checking_moves(board, attacker):
+        checked_board = _apply_move(board, *move)
+        phase, winner = _board_status(checked_board, defender)
+        if phase in {"checkmate", "stalemate"} and winner == attacker:
+            return True
+        if attacker_turns_left == 1:
+            continue
+        replies = _all_legal_moves(checked_board, defender)
+        if replies and all(
+            _can_force_mate_by_checks(
+                _apply_move(checked_board, *reply),
+                attacker,
+                attacker_turns_left - 1,
+            )
+            for reply in replies
+        ):
+            return True
+    return False
+
+
+def _classify_repetition_move(
+    previous: _HistoryEntry,
+    current: _HistoryEntry,
+) -> Literal["check", "kill", "chase", "idle"]:
+    if current.mover is None:
+        return "idle"
+    if current.gives_check:
+        return "check"
+    if current.move is None:
+        return "idle"
+    start, end = current.move
+    if previous.board[end[0]][end[1]] is not None:
+        return "idle"
+    if (
+        _can_force_mate_by_checks(current.board, current.mover)
+        and not _can_force_mate_by_checks(previous.board, current.mover)
+    ):
+        return "kill"
+    if _creates_chase(previous.board, current.board, current.mover):
+        return "chase"
+    return "idle"
+
+
+def _classify_player_pattern(
+    moves: list[Literal["check", "kill", "chase", "idle"]],
+) -> tuple[bool, Literal[
+    "perpetual-check",
+    "perpetual-kill",
+    "perpetual-chase",
+    "mixed-prohibited",
+] | None, bool]:
+    if not moves or "idle" in moves:
+        return False, None, False
+    if all(move == "check" for move in moves):
+        return True, "perpetual-check", True
+    kinds = set(moves)
+    if kinds == {"kill"}:
+        return True, "perpetual-kill", False
+    if kinds == {"chase"}:
+        return True, "perpetual-chase", False
+    return True, "mixed-prohibited", False
+
+
 def _adjudicate_repetition(
     history: list[_HistoryEntry],
-) -> tuple[Literal["perpetual-check", "repetition-draw"], Player | None] | None:
+) -> tuple[
+    Literal["perpetual-check", "prohibited-repetition", "repetition-draw"],
+    Player | None,
+] | None:
     current_key = history[-1].key
     occurrences = [index for index, entry in enumerate(history) if entry.key == current_key]
     if len(occurrences) < 3:
         return None
-    window = history[occurrences[-3] + 1 :]
-    red_checks = [entry for entry in window if entry.mover == "red"]
-    black_checks = [entry for entry in window if entry.mover == "black"]
-    red_perpetual = bool(red_checks) and all(entry.gives_check for entry in red_checks)
-    black_perpetual = bool(black_checks) and all(entry.gives_check for entry in black_checks)
-    if red_perpetual != black_perpetual:
-        return "perpetual-check", "red" if red_perpetual else "black"
+    window = history[occurrences[-3] :]
+    red_moves: list[Literal["check", "kill", "chase", "idle"]] = []
+    black_moves: list[Literal["check", "kill", "chase", "idle"]] = []
+    for previous, current in zip(window, window[1:]):
+        nature = _classify_repetition_move(previous, current)
+        if current.mover == "red":
+            red_moves.append(nature)
+        elif current.mover == "black":
+            black_moves.append(nature)
+
+    red_forbidden, _, red_all_checks = _classify_player_pattern(red_moves)
+    black_forbidden, _, black_all_checks = _classify_player_pattern(black_moves)
+    if red_all_checks != black_all_checks:
+        return "perpetual-check", "red" if red_all_checks else "black"
+    if red_forbidden != black_forbidden:
+        return (
+            "prohibited-repetition",
+            "red" if red_forbidden else "black",
+        )
     return "repetition-draw", None

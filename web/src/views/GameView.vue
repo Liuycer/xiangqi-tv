@@ -239,6 +239,8 @@ const gameStatusLabel = computed(() => {
       return '困毙'
     case 'perpetual-check':
       return '长将判负'
+    case 'prohibited-repetition':
+      return '禁止着法判负'
     case 'repetition-draw':
       return '重复和棋'
     default:
@@ -257,6 +259,13 @@ const statusCaption = computed(() => {
   }
   if (gameState.value.status.phase === 'perpetual-check') {
     return `${gameState.value.status.offender === 'red' ? '红方' : '黑方'}长将`
+  }
+  if (gameState.value.status.phase === 'prohibited-repetition') {
+    const violation = gameState.value.status.repetitionViolation
+    const reason = violation === 'perpetual-kill'
+      ? '长杀'
+      : violation === 'perpetual-chase' ? '长捉' : '攻击性循环'
+    return `${gameState.value.status.offender === 'red' ? '红方' : '黑方'}${reason}`
   }
   if (gameState.value.status.phase === 'repetition-draw') {
     return '三次重复局面'
@@ -349,7 +358,12 @@ function getTrackingPayload() {
 }
 
 function getTermination(phase: string): string {
-  if (phase === 'checkmate' || phase === 'stalemate' || phase === 'perpetual-check') {
+  if (
+    phase === 'checkmate'
+    || phase === 'stalemate'
+    || phase === 'perpetual-check'
+    || phase === 'prohibited-repetition'
+  ) {
     return phase
   }
   if (phase === 'repetition-draw') {

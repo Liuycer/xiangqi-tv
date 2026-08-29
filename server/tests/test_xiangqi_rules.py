@@ -135,6 +135,30 @@ class ReplayValidationTests(unittest.TestCase):
 
 
 class TerminalValidationTests(unittest.TestCase):
+    def test_cxa_long_chase_is_a_prohibited_repetition_loss(self) -> None:
+        fen = make_fen(
+            {
+                (0, 4): "k",
+                (5, 2): "c",
+                (5, 4): "p",
+                (6, 0): "R",
+                (9, 4): "K",
+            }
+        )
+        moves = ["a3a4", "c4c3", "a4a3", "c3c4"] * 2
+
+        replay = validate_replay(fen, moves)
+
+        self.assertEqual(replay.phase, "prohibited-repetition")
+        self.assertEqual(replay.winner, "black")
+        self.assertEqual(replay.offender, "red")
+        validate_finished_game(
+            replay,
+            state="completed",
+            result="black_win",
+            termination="prohibited-repetition",
+        )
+
     def test_recognizes_checkmate_and_validates_result(self) -> None:
         fen = make_fen(
             {

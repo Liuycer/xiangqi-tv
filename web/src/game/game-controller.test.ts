@@ -224,4 +224,30 @@ describe('GameController repetition rules', () => {
     expect(controller.undoMove()).toBe(true)
     expect(controller.getSnapshot().status.phase).toBe('playing')
   })
+
+  it('penalizes a unilateral long chase under the 2020 CXA rules', () => {
+    const board: BoardState = [
+      { id: 'red-general', type: 'general', player: 'red', row: 9, col: 4 },
+      { id: 'black-general', type: 'general', player: 'black', row: 0, col: 4 },
+      { id: 'red-rook', type: 'rook', player: 'red', row: 6, col: 0 },
+      { id: 'black-cannon', type: 'cannon', player: 'black', row: 5, col: 2 },
+      { id: 'black-soldier', type: 'soldier', player: 'black', row: 5, col: 4 },
+    ]
+    const controller = new GameController(board)
+
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      play(controller, [6, 0], [5, 0])
+      play(controller, [5, 2], [6, 2])
+      play(controller, [5, 0], [6, 0])
+      play(controller, [6, 2], [5, 2])
+    }
+
+    expect(controller.getSnapshot().status).toEqual({
+      phase: 'prohibited-repetition',
+      checkedPlayer: null,
+      winner: 'black',
+      offender: 'red',
+      repetitionViolation: 'perpetual-chase',
+    })
+  })
 })

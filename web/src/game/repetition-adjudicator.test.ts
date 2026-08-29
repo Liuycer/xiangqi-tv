@@ -20,6 +20,7 @@ function entry(
 ): PositionHistoryEntry {
   return {
     key,
+    board: BASE_BOARD,
     sideToMove: mover === 'red' ? 'black' : 'red',
     move: null,
     mover,
@@ -44,6 +45,7 @@ describe('repetition adjudicator', () => {
 
     expect(adjudicateRepetition(history)).toEqual({
       type: 'perpetual-check',
+      violation: 'perpetual-check',
       offender: 'black',
       winner: 'red',
     })
@@ -72,6 +74,7 @@ describe('repetition adjudicator', () => {
 
     expect(adjudicateRepetition(history)).toEqual({
       type: 'perpetual-check',
+      violation: 'perpetual-check',
       offender: 'black',
       winner: 'red',
     })

@@ -88,6 +88,13 @@ code transfers the complete active Profile to a new device and is consumed in
 the same transaction. Generating a replacement or archiving the Profile
 invalidates older codes, and the destination still obeys the six-Profile limit.
 
+API version 0.7.0 extends independent replay validation with deterministic
+adjudication based on the China Xiangqi Association 2020 rules. The validator
+classifies repeated moves as check, kill, chase, or idle and rejects forged
+outcomes for unilateral perpetual check and other prohibited attacking cycles.
+Ambiguous deep-exchange cases that require human referee judgment are treated
+as allowed moves instead of risking a false loss.
+
 ## Runtime configuration
 
 The systemd unit reads `/etc/xiangqi-engine-api.env`:
