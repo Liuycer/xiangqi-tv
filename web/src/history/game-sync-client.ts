@@ -113,6 +113,22 @@ export interface GameHistoryPage {
   readonly items: ReadonlyArray<GameHistorySummary>
 }
 
+export function mergeGameHistoryItems(
+  current: ReadonlyArray<GameHistorySummary>,
+  incoming: ReadonlyArray<GameHistorySummary>,
+): ReadonlyArray<GameHistorySummary> {
+  const seen = new Set(current.map((item) => item.id))
+  const additions = incoming.filter((item) => {
+    if (seen.has(item.id)) return false
+    seen.add(item.id)
+    return true
+  })
+  return Object.freeze([
+    ...current,
+    ...additions,
+  ])
+}
+
 export interface GameSnapshotPayload {
   readonly deviceId: string
   readonly playerId: string
@@ -549,7 +565,13 @@ export class GameSyncClient {
       'GET',
       `/v1/xiangqi/games?deviceId=${encodeURIComponent(deviceId)}&playerId=${encodeURIComponent(playerId)}&limit=20&offset=${offset}`,
     )
-    if (typeof payload !== 'object' || payload === null || !Array.isArray((payload as GameHistoryPage).items)) {
+    if (
+      typeof payload !== 'object'
+      || payload === null
+      || !Number.isInteger((payload as GameHistoryPage).total)
+      || !Number.isInteger((payload as GameHistoryPage).offset)
+      || !Array.isArray((payload as GameHistoryPage).items)
+    ) {
       throw new Error('历史对局列表格式无效')
     }
     return payload as GameHistoryPage

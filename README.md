@@ -2,7 +2,7 @@
 
 面向天猫魔盒 Q8 畅越版的中国象棋电视游戏。棋盘、规则、交互和本地回退 AI 运行在电视盒子上；排位自适应、Pikafish 走棋、局面分析、历史对局与赛后复盘由云端服务完成。客户端采用 Vue 3 + TypeScript，并由一个尽可能薄的 Kotlin WebView 壳打包为 Android APK。
 
-当前进度：Phase 25–36 已完成开发。游戏以真人棋手 Profile 为核心运行排位自适应模式；Phase 29–35 完成可靠性、历史与档案恢复，Phase 36 按中国象棋协会 2020 规则增加攻击性循环裁定。
+当前进度：Phase 25–37 已完成开发。游戏以真人棋手 Profile 为核心运行排位自适应模式；Phase 29–35 完成可靠性、历史与档案恢复，Phase 36 按中国象棋协会 2020 规则增加攻击性循环裁定，Phase 37 修复历史对局分页与遥控器快速导航请求拥塞。
 
 ## 已验证目标设备
 
@@ -59,7 +59,7 @@ UI → InputController → GameController → RuleEngine / GameState / AIEngine
 - 棋手 Profile：冷启动选择实际玩家，每台设备最多 6 个独立档案，支持新建、改名、头像、切换、重置和软删除。
 - 排位自适应：客户端不再提供固定难度选单；每个 Profile 独立保存排位分、A0–A7 段位和调整进度。
 - 云端 AI：普通对局、三路候选局面分析和赛后逐手复盘由 2C2G VPS 上的 Pikafish 执行；断网时安全回退到本地 AI。
-- 历史对局：服务器保存对局时间、结果、评级、棋谱和 AI 分析，客户端按需加载并逐手回放。
+- 历史对局：服务器保存对局时间、结果、评级、棋谱和 AI 分析；客户端每页按需加载 20 局，支持鼠标/遥控器继续分页并逐手回放。
 - 电视交互：鼠标优先，同时完整支持遥控器方向键、OK 和 BACK；1080P 应用画布与 4K HDMI 输出均已真机验证。
 
 当前排位等级与 AI 强度：
@@ -219,6 +219,8 @@ adb shell am start -n com.xiangqitv.app/.MainActivity
 同步诊断与档案恢复见 [Phase 35 同步与恢复报告](docs/phase-35-sync-profile-recovery.md)。
 
 中规循环裁定见 [Phase 36 中国象棋协会循环规则报告](docs/phase-36-cxa-repetition.md)。
+
+历史分页与遥控器请求节流见 [Phase 37 历史对局分页修复报告](docs/phase-37-history-pagination.md)。
 
 ## 操作方式
 
