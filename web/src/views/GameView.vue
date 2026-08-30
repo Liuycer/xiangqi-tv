@@ -1,6 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
+import {
+  createMatchAiConfig,
+  restoreMatchAiConfig,
+  type MatchAiConfig,
+} from '../adaptive/match-ai-config'
 import { AiClient } from '../ai/ai-client'
 import { getLocalFallbackDifficulty } from '../ai/ai-engine'
 import {
@@ -19,6 +24,8 @@ import AnalysisPanel from '../components/AnalysisPanel.vue'
 import ChessBoard from '../components/ChessBoard.vue'
 import HistoryPanel from '../components/HistoryPanel.vue'
 import ProfilePanel from '../components/ProfilePanel.vue'
+import VictoryCelebration from '../components/VictoryCelebration.vue'
+import { getFinishCelebration } from '../experience/finish-celebration'
 import { loadExperienceSettings, saveExperienceSettings } from '../experience/settings'
 import { SoundController } from '../experience/sound-controller'
 import { INITIAL_BOARD } from '../game/board'
@@ -109,6 +116,8 @@ const lastAiResult = ref<AiSearchResult | null>(null)
 const lastAiSource = ref<'local' | 'cloud' | null>(null)
 const lastAiFallback = ref(false)
 const experienceSettings = ref(loadExperienceSettings())
+const victoryCelebrationSequence = ref(0)
+const victoryCelebrationActive = ref(false)
 const experienceOpen = ref(false)
 const experienceFocusIndex = ref(0)
 const analysisOpen = ref(false)
@@ -122,6 +131,7 @@ const analysisFocusIndex = ref(1)
 const historyOpen = ref(false)
 const historyLoading = ref(false)
 const historyLoadingMore = ref(false)
+const historyResuming = ref(false)
 const historyError = ref<string | null>(null)
 const historyItems = ref<ReadonlyArray<GameHistorySummary>>([])
 const historyTotal = ref(0)
@@ -135,6 +145,10 @@ const profileRecoveryCode = ref<string | null>(null)
 const profileRecoveryBusy = ref(false)
 const profilePanelRef = ref<InstanceType<typeof ProfilePanel> | null>(null)
 const soundController = new SoundController(experienceSettings.value.soundEnabled)
+const matchAiConfig = ref<MatchAiConfig>(createMatchAiConfig(
+  adaptiveProfile.value.currentLevel,
+  adaptiveProfile.value.currentDepth,
+))
 let aiGeneration = 0
 let analysisGeneration = 0
 let historyGeneration = 0
@@ -143,6 +157,7 @@ let gameVariationSeed = createGameVariationSeed()
 let openingPreference = advanceOpeningPreference()
 let previousOpeningMove = loadPreviousOpeningMove()
 let currentClientGameId = createClientGameId()
+let currentGameRevision = 0
 let trackedUndoCount = 0
 let trackedFallbackUsed = false
 let trackedSettingsChanged = false
@@ -179,6 +194,17 @@ const inputModeLabel = computed(() => (inputState.value.mode === 'mouse' ? '鼠�
 const gameModeLabel = computed(() => (gameMode.value === 'local' ? '本地双人' : '人机对战'))
 const analysisConfigured = computed(() => remoteAiClient.isConfigured())
 const historyHasMore = computed(() => historyNextOffset.value < historyTotal.value)
+const historyCanResume = computed(() => {
+  const detail = historyDetail.value
+  return detail !== null
+    && detail.plyCount > 0
+    && (detail.state === 'active' || detail.state === 'abandoned')
+    && !(
+      trackingStarted
+      && !trackingFinished
+      && detail.clientGameId === currentClientGameId
+    )
+})
 const analysisVisibleCandidateRank = computed(() => {
   if (analysisOpen.value) {
     if (inputState.value.mode === 'remote' && analysisFocusIndex.value >= 5) {
@@ -208,16 +234,16 @@ const analysisActionLabel = computed(() => {
   }
   return analysisConfigured.value ? 'Pikafish · 三路候选' : '云端服务未配置'
 })
-const targetAiDepth = computed(() => adaptiveProfile.value.currentDepth)
+const targetAiDepth = computed(() => matchAiConfig.value.depth)
 const difficultyLabel = computed(() => (
-  `排位自适应 · ${adaptiveProfile.value.currentCode} D${adaptiveProfile.value.currentDepth}`
+  `排位自适应 · A${matchAiConfig.value.level} D${matchAiConfig.value.depth}`
 ))
 const aiSearchSummary = computed(() => {
   if (aiThinking.value) {
     return '测量中'
   }
   if (!lastAiResult.value) {
-    if (adaptiveProfile.value.cloudEnabled && !remoteAiClient.isConfigured()) {
+    if (matchAiConfig.value.cloudEnabled && !remoteAiClient.isConfigured()) {
       return '云端未配置 · 将使用本地回退'
     }
     return aiError.value ?? '等待首回合'
@@ -232,6 +258,12 @@ const aiNodeSummary = computed(() => (
 ))
 const currentPlayerLabel = computed(() => (gameState.value.currentPlayer === 'red' ? '红方' : '黑方'))
 const winnerLabel = computed(() => (gameState.value.status.winner === 'red' ? '红方' : '黑方'))
+const restartActionLabel = computed(() => (
+  isFinished(gameState.value.status) ? '再来一局' : '重新开始'
+))
+const restartActionHint = computed(() => (
+  isFinished(gameState.value.status) ? '以当前设置开新局' : '恢复初始棋局'
+))
 const gameStatusLabel = computed(() => {
   if (aiThinking.value) {
     return 'AI 思考中'
@@ -322,8 +354,13 @@ function syncState(): void {
       cancelAnalysisRequest(true)
     }
     if (nextGameState.history.length > currentGameState.history.length) {
-      if (nextGameState.status.winner) {
-        soundController.play('victory')
+      const finishCelebration = getFinishCelebration(
+        gameMode.value,
+        nextGameState.status.winner,
+      )
+      if (finishCelebration) {
+        soundController.play(finishCelebration.sound)
+        if (finishCelebration.fireworks) startVictoryCelebration()
       } else if (nextGameState.status.phase === 'check') {
         soundController.play('check')
       } else if (nextGameState.lastMove?.capturedPiece) {
@@ -346,6 +383,20 @@ function syncState(): void {
   inputState.value = inputController.getSnapshot()
 }
 
+function startVictoryCelebration(): void {
+  if (!experienceSettings.value.motionEnabled) return
+  victoryCelebrationSequence.value += 1
+  victoryCelebrationActive.value = true
+}
+
+function stopVictoryCelebration(): void {
+  victoryCelebrationActive.value = false
+}
+
+function completeVictoryCelebration(): void {
+  victoryCelebrationActive.value = false
+}
+
 function getTrackedMoves(): ReadonlyArray<string> {
   return gameController.getSnapshot().history.map(moveToUci)
 }
@@ -360,6 +411,7 @@ function getTrackingPayload() {
     undoCount: trackedUndoCount,
     fallbackUsed: trackedFallbackUsed,
     settingsChanged: trackedSettingsChanged,
+    revision: currentGameRevision,
   } as const
 }
 
@@ -379,12 +431,18 @@ function getTermination(phase: string): string {
 }
 
 function beginTrackedGame(): void {
+  stopVictoryCelebration()
   currentClientGameId = createClientGameId()
+  currentGameRevision = 0
   trackedUndoCount = 0
   trackedFallbackUsed = false
   trackedSettingsChanged = false
   trackingStarted = true
   trackingFinished = false
+  matchAiConfig.value = createMatchAiConfig(
+    adaptiveProfile.value.currentLevel,
+    adaptiveProfile.value.currentDepth,
+  )
   gameSyncClient.start({
     clientGameId: currentClientGameId,
     playerId: playerId.value,
@@ -393,7 +451,7 @@ function beginTrackedGame(): void {
     difficulty: gameMode.value === 'local' ? 'local' : 'adaptive',
     aiDepth: gameMode.value === 'local' ? null : targetAiDepth.value,
     variationSeed: gameMode.value === 'ai' ? gameVariationSeed : null,
-    adaptiveLevel: gameMode.value === 'ai' ? adaptiveProfile.value.currentLevel : null,
+    adaptiveLevel: gameMode.value === 'ai' ? matchAiConfig.value.level : null,
     initialFen: boardToFen(INITIAL_BOARD, 'red'),
   })
 }
@@ -499,6 +557,7 @@ function toggleGameMode(): void {
 }
 
 function openProfilePanel(): void {
+  stopVictoryCelebration()
   closeAnalysisPanel()
   closeHistoryPanel()
   experienceOpen.value = false
@@ -667,6 +726,7 @@ async function recoverProfile(recoveryCode: string): Promise<void> {
 }
 
 function openExperiencePanel(): void {
+  stopVictoryCelebration()
   closeAnalysisPanel()
   closeHistoryPanel()
   gameController.cancelSelection()
@@ -706,6 +766,7 @@ function closeAnalysisPanel(): void {
 }
 
 function openHistoryPanel(): void {
+  stopVictoryCelebration()
   resetViewportScroll()
   gameController.cancelSelection()
   profileOpen.value = false
@@ -725,6 +786,7 @@ function resetViewportScroll(): void {
 }
 
 function closeHistoryPanel(): void {
+  if (historyResuming.value) return
   historyGeneration += 1
   cancelPendingHistorySelection()
   historyOpen.value = false
@@ -860,6 +922,97 @@ function selectHistoryGame(gameId: string, deferred = false): void {
   }, 300)
 }
 
+async function resumeHistoryGame(): Promise<void> {
+  const detail = historyDetail.value
+  if (!detail || !historyCanResume.value || historyResuming.value) return
+
+  const initialFen = boardToFen(INITIAL_BOARD, 'red')
+  if (detail.initialFen !== initialFen) {
+    historyError.value = '当前客户端暂不支持恢复非标准开局'
+    return
+  }
+  const replay = buildReplayPosition(
+    detail.moves.map((move) => move.uci),
+    detail.moves.length,
+  )
+  if (replay.appliedPly !== detail.moves.length) {
+    historyError.value = '历史棋谱无法恢复，请刷新后重试'
+    return
+  }
+
+  const currentSnapshot = gameController.getSnapshot()
+  if (
+    currentSnapshot.history.length > 0
+    && !window.confirm('继续这盘历史对局后，当前棋局将保存为未完成。确定继续吗？')
+  ) {
+    return
+  }
+
+  const generation = historyGeneration
+  const previousClientGameId = currentClientGameId
+  historyResuming.value = true
+  stopVictoryCelebration()
+  historyError.value = null
+  cancelPendingHistorySelection()
+  cancelAnalysisRequest(true)
+  cancelAiSearch()
+  try {
+    if (trackingStarted && !trackingFinished && currentSnapshot.history.length > 0) {
+      queueTrackedSnapshot()
+    }
+    await gameSyncClient.flushAndRequireEmpty()
+    const resumed = await gameSyncClient.resumeGame(
+      deviceId,
+      playerId.value,
+      detail.id,
+      detail.revision,
+    )
+    if (generation !== historyGeneration || !historyOpen.value) return
+
+    if (!gameController.restoreMoves(replay.moves.map((move) => move.move))) {
+      throw new Error('历史棋谱无法恢复，请刷新后重试')
+    }
+
+    if (currentSnapshot.history.length === 0) {
+      gameSyncClient.discardPendingStart(previousClientGameId)
+    }
+    gameMode.value = detail.mode
+    currentClientGameId = resumed.clientGameId
+    currentGameRevision = resumed.revision
+    trackedUndoCount = resumed.undoCount
+    trackedFallbackUsed = resumed.fallbackUsed
+    trackedSettingsChanged = resumed.settingsChanged
+    trackingStarted = true
+    trackingFinished = false
+    gameVariationSeed = resumed.variationSeed ?? createGameVariationSeed()
+    matchAiConfig.value = restoreMatchAiConfig(
+      resumed.adaptiveLevel,
+      resumed.aiDepth,
+      adaptiveProfile.value.currentLevel,
+      adaptiveProfile.value.currentDepth,
+    )
+    resetAiResult()
+    analysisCandidateRank.value = null
+    analysisPreviewRank.value = null
+    historyGeneration += 1
+    historyOpen.value = false
+    historyLoading.value = false
+    historyLoadingMore.value = false
+    gameState.value = gameController.getSnapshot()
+    inputState.value = inputController.getSnapshot()
+    hoveredSquare.value = null
+    resetViewportScroll()
+    void requestAiMoveIfNeeded()
+  } catch (error) {
+    if (generation === historyGeneration && historyOpen.value) {
+      historyError.value = error instanceof Error ? error.message : '继续对局失败'
+    }
+    void requestAiMoveIfNeeded()
+  } finally {
+    historyResuming.value = false
+  }
+}
+
 function replayPreviousMove(): void {
   historyReplayPly.value = Math.max(0, historyReplayPly.value - 1)
 }
@@ -957,6 +1110,7 @@ async function requestPositionAnalysis(): Promise<void> {
 
 function updateExperienceSettings(soundEnabled: boolean, motionEnabled: boolean): void {
   experienceSettings.value = { soundEnabled, motionEnabled }
+  if (!motionEnabled) stopVictoryCelebration()
   soundController.setEnabled(soundEnabled)
   saveExperienceSettings(experienceSettings.value)
 }
@@ -1022,8 +1176,8 @@ async function requestAiMoveIfNeeded(): Promise<void> {
     let result: AiSearchResult
     let source: 'local' | 'cloud' = 'local'
     let usedFallback = false
-    const useCloudForTurn = adaptiveProfile.value.cloudEnabled
-    const humanizeTurn = adaptiveProfile.value.humanize
+    const useCloudForTurn = matchAiConfig.value.cloudEnabled
+    const humanizeTurn = matchAiConfig.value.humanize
     if (!useCloudForTurn) {
       result = await aiClient.findMove(snapshot.board, 'black', 'easy')
     } else if (remoteAiClient.isConfigured()) {
@@ -1035,7 +1189,7 @@ async function requestAiMoveIfNeeded(): Promise<void> {
           moves: snapshot.history,
         }, targetAiDepth.value, {
           humanize: humanizeTurn,
-          humanizeStyle: adaptiveProfile.value.humanizeStyle ?? undefined,
+          humanizeStyle: matchAiConfig.value.humanizeStyle ?? undefined,
           variationSeed: gameVariationSeed,
           openingPreference,
           avoidOpeningMove: previousOpeningMove ?? undefined,
@@ -1201,9 +1355,19 @@ function handleKeyDown(event: KeyboardEvent): void {
 
   if (historyOpen.value) {
     let handled = true
+    if (historyResuming.value) {
+      event.preventDefault()
+      return
+    }
     const itemCount = historyItems.value.length
     const loadMoreIndex = historyHasMore.value ? itemCount + 1 : -1
-    const previousIndex = itemCount + (historyHasMore.value ? 2 : 1)
+    const resumeIndex = historyCanResume.value
+      ? itemCount + (historyHasMore.value ? 2 : 1)
+      : -1
+    const previousIndex = itemCount
+      + (historyHasMore.value ? 1 : 0)
+      + (historyCanResume.value ? 1 : 0)
+      + 1
     const nextIndex = previousIndex + 1
     if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
       if (itemCount > 0) {
@@ -1211,12 +1375,24 @@ function handleKeyDown(event: KeyboardEvent): void {
           if (event.key === 'ArrowUp') {
             const item = historyItems.value[itemCount - 1]
             if (item) selectHistoryGame(item.id, true)
+          } else if (historyCanResume.value) {
+            historyFocusIndex.value = resumeIndex
+          }
+        } else if (historyFocusIndex.value === resumeIndex) {
+          if (event.key === 'ArrowUp') {
+            historyFocusIndex.value = historyHasMore.value
+              ? loadMoreIndex
+              : itemCount
           }
         } else if (historyFocusIndex.value >= 1 && historyFocusIndex.value <= itemCount) {
           const current = historyFocusIndex.value - 1
-          if (event.key === 'ArrowDown' && current === itemCount - 1 && historyHasMore.value) {
+          if (event.key === 'ArrowDown' && current === itemCount - 1) {
             cancelPendingHistorySelection()
-            historyFocusIndex.value = loadMoreIndex
+            if (historyHasMore.value) {
+              historyFocusIndex.value = loadMoreIndex
+            } else if (historyCanResume.value) {
+              historyFocusIndex.value = resumeIndex
+            }
           } else {
             const offset = event.key === 'ArrowUp' ? -1 : 1
             const next = Math.min(Math.max(current + offset, 0), itemCount - 1)
@@ -1239,6 +1415,8 @@ function handleKeyDown(event: KeyboardEvent): void {
         closeHistoryPanel()
       } else if (historyFocusIndex.value === loadMoreIndex) {
         void loadMoreGameHistory(true)
+      } else if (historyFocusIndex.value === resumeIndex) {
+        void resumeHistoryGame()
       } else if (historyFocusIndex.value === previousIndex) {
         replayPreviousMove()
       } else if (historyFocusIndex.value === nextIndex) {
@@ -1334,6 +1512,7 @@ function handleKeyDown(event: KeyboardEvent): void {
 
 function handleVisibilityChange(): void {
   if (document.hidden) {
+    stopVictoryCelebration()
     cancelAnalysisRequest(false)
     cancelAiSearch()
     return
@@ -1380,6 +1559,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  stopVictoryCelebration()
   finishTrackedGame('abandoned', 'app_closed')
   window.removeEventListener('keydown', handleKeyDown)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
@@ -1504,8 +1684,8 @@ onBeforeUnmount(() => {
             data-action-index="1"
             @click="handleRestart"
           >
-            <strong>重新开始</strong>
-            <small>恢复初始棋局</small>
+            <strong>{{ restartActionLabel }}</strong>
+            <small>{{ restartActionHint }}</small>
           </button>
           <button
             class="action-button"
@@ -1684,6 +1864,8 @@ onBeforeUnmount(() => {
       :loading-more="historyLoadingMore"
       :has-more="historyHasMore"
       :total="historyTotal"
+      :can-resume="historyCanResume"
+      :resume-busy="historyResuming"
       :error="historyError"
       :focus-index="historyFocusIndex"
       :sync-failures="syncFailures"
@@ -1692,7 +1874,14 @@ onBeforeUnmount(() => {
       @previous="replayPreviousMove"
       @next="replayNextMove"
       @load-more="loadMoreGameHistory()"
+      @resume="resumeHistoryGame"
       @clear-failures="clearSyncFailure"
+    />
+
+    <VictoryCelebration
+      :active="victoryCelebrationActive"
+      :sequence="victoryCelebrationSequence"
+      @complete="completeVictoryCelebration"
     />
   </main>
 </template>

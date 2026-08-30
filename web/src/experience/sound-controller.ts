@@ -1,4 +1,4 @@
-export type SoundCue = 'select' | 'move' | 'capture' | 'check' | 'victory'
+export type SoundCue = 'select' | 'move' | 'capture' | 'check' | 'victory' | 'defeat'
 
 interface Tone {
   readonly frequency: number
@@ -20,9 +20,15 @@ const SOUND_TONES: Readonly<Record<SoundCue, ReadonlyArray<Tone>>> = {
     { frequency: 660, duration: 0.12, delay: 0.08, volume: 0.06 },
   ],
   victory: [
-    { frequency: 392, duration: 0.12, volume: 0.05 },
-    { frequency: 523, duration: 0.14, delay: 0.11, volume: 0.055 },
-    { frequency: 659, duration: 0.2, delay: 0.24, volume: 0.06 },
+    { frequency: 392, duration: 0.15, volume: 0.045 },
+    { frequency: 523, duration: 0.17, delay: 0.12, volume: 0.05 },
+    { frequency: 659, duration: 0.22, delay: 0.26, volume: 0.055 },
+    { frequency: 784, duration: 0.26, delay: 0.45, volume: 0.05 },
+    { frequency: 1047, duration: 0.34, delay: 0.68, volume: 0.055 },
+  ],
+  defeat: [
+    { frequency: 330, duration: 0.16, volume: 0.038, type: 'triangle' },
+    { frequency: 247, duration: 0.24, delay: 0.14, volume: 0.035, type: 'triangle' },
   ],
 }
 

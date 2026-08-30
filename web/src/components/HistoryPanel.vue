@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 
 import ChessBoard from './ChessBoard.vue'
 import type {
@@ -21,6 +21,8 @@ const props = defineProps<{
   loadingMore: boolean
   hasMore: boolean
   total: number
+  canResume: boolean
+  resumeBusy: boolean
   error: string | null
   focusIndex: number
   syncFailures: ReadonlyArray<SyncFailureSummary>
@@ -32,11 +34,19 @@ const emit = defineEmits<{
   previous: []
   next: []
   loadMore: []
+  resume: []
   clearFailures: [gameId: string | null]
 }>()
 
 const failureOpen = ref(false)
 const listRef = ref<HTMLElement | null>(null)
+const resumeFocusIndex = computed(() => (
+  props.items.length + (props.hasMore ? 2 : 1)
+))
+const previousFocusIndex = computed(() => (
+  props.items.length + (props.hasMore ? 1 : 0) + (props.canResume ? 1 : 0) + 1
+))
+const nextFocusIndex = computed(() => previousFocusIndex.value + 1)
 
 watch(() => props.focusIndex, async () => {
   if (props.inputMode !== 'remote') return
@@ -137,6 +147,7 @@ function operationLabel(failure: SyncFailureSummary): string {
             type="button"
             class="close-button"
             :class="{ 'control--focused': inputMode === 'remote' && focusIndex === 0 }"
+            :disabled="resumeBusy"
             @click="emit('close')"
           >关闭</button>
         </div>
@@ -200,18 +211,28 @@ function operationLabel(failure: SyncFailureSummary): string {
                 <span>{{ difficultyLabel(detail) }}</span>
                 <span>{{ analysisLabel(detail) }}</span>
               </div>
+              <button
+                v-if="canResume"
+                type="button"
+                class="resume-button"
+                :class="{
+                  'control--focused': inputMode === 'remote' && focusIndex === resumeFocusIndex,
+                }"
+                :disabled="resumeBusy"
+                @click="emit('resume')"
+              >{{ resumeBusy ? '正在恢复对局…' : '继续这盘对局' }}</button>
               <div class="replay-controls">
                 <button
                   type="button"
                   :disabled="replayPly <= 0"
-                  :class="{ 'control--focused': inputMode === 'remote' && focusIndex === items.length + (hasMore ? 2 : 1) }"
+                  :class="{ 'control--focused': inputMode === 'remote' && focusIndex === previousFocusIndex }"
                   @click="emit('previous')"
                 >上一手</button>
                 <strong>{{ replay.appliedPly }} / {{ detail.moves.length }}</strong>
                 <button
                   type="button"
                   :disabled="replayPly >= detail.moves.length"
-                  :class="{ 'control--focused': inputMode === 'remote' && focusIndex === items.length + (hasMore ? 3 : 2) }"
+                  :class="{ 'control--focused': inputMode === 'remote' && focusIndex === nextFocusIndex }"
                   @click="emit('next')"
                 >下一手</button>
               </div>
@@ -235,7 +256,7 @@ function operationLabel(failure: SyncFailureSummary): string {
       </div>
 
       <p v-if="error && items.length" class="inline-error">{{ error }}</p>
-      <p class="history-hint">遥控器：↑↓选择对局，←→回放，BACK 关闭 · 鼠标：点击对局和回放按钮</p>
+      <p class="history-hint">遥控器：↑↓选择/继续，←→回放，BACK 关闭 · 鼠标：点击对局、继续和回放按钮</p>
     </section>
 
     <div
@@ -380,6 +401,19 @@ function operationLabel(failure: SyncFailureSummary): string {
 .replay-summary { display: flex; flex-direction: column; gap: 0.8vh; padding-bottom: 1.5vh; border-bottom: 1px solid rgba(201, 157, 94, 0.3); }
 .replay-summary strong { font-size: 1.5vw; color: #f1d8a5; }
 .replay-summary span { font-size: 0.95vw; color: #b49a78; }
+
+.resume-button {
+  width: 100%;
+  margin-top: 1.3vh;
+  padding: 1.2vh 0.8vw;
+  border: 2px solid #c78a3d;
+  background: linear-gradient(180deg, #8c4d24, #633219);
+  color: #ffe5ad;
+  font-size: 1.05vw;
+  font-weight: 700;
+  cursor: pointer;
+}
+.resume-button:disabled { opacity: 0.6; cursor: default; }
 
 .replay-controls { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 0.8vw; margin: 1.6vh 0; }
 .replay-controls button { padding: 1.2vh 0.5vw; font-size: 0.95vw; }

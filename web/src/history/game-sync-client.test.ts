@@ -98,6 +98,7 @@ function snapshotPayload(moves: ReadonlyArray<string>): GameSnapshotPayload {
     undoCount: 0,
     fallbackUsed: false,
     settingsChanged: false,
+    revision: 0,
   }
 }
 
@@ -128,6 +129,32 @@ afterEach(() => {
 })
 
 describe('game sync outbox', () => {
+  it('resumes a stored game with its expected revision', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        state: 'active',
+        revision: 3,
+        clientGameId: 'game_resume_12345678',
+      }), { status: 200 }),
+    )
+    const client = createClient([])
+
+    const resumed = await client.resumeGame(
+      'device_12345678',
+      'profile_12345678',
+      'stored-game-id',
+      2,
+    )
+
+    expect(resumed.revision).toBe(3)
+    expect(fetchMock.mock.calls[0]?.[0]).toContain('/stored-game-id/resume')
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      deviceId: 'device_12345678',
+      playerId: 'profile_12345678',
+      expectedRevision: 2,
+    })
+  })
+
   it('requests a later history page and merges it without duplicate games', async () => {
     const page = {
       total: 25,

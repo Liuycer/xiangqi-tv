@@ -71,14 +71,19 @@ export interface GameHistorySummary {
   readonly mode: 'ai' | 'local'
   readonly difficulty: string
   readonly aiDepth: number | null
+  readonly variationSeed: number | null
   readonly adaptiveLevel: number | null
   readonly state: 'active' | 'completed' | 'abandoned'
   readonly result: 'red_win' | 'black_win' | 'draw' | 'abandoned' | null
   readonly termination: string | null
+  readonly currentPlayer: 'red' | 'black'
   readonly plyCount: number
   readonly undoCount: number
   readonly fallbackUsed: boolean
   readonly settingsChanged: boolean
+  readonly revision: number
+  readonly resumeCount: number
+  readonly lastResumedAt: string | null
   readonly analysisState: 'not_queued' | 'queued' | 'running' | 'completed' | 'failed'
   readonly averageLossCp: number | null
   readonly blunderCount: number
@@ -137,12 +142,38 @@ export interface GameSnapshotPayload {
   readonly undoCount: number
   readonly fallbackUsed: boolean
   readonly settingsChanged: boolean
+  readonly revision: number
 }
 
 export interface GameFinishPayload extends GameSnapshotPayload {
   readonly state: 'completed' | 'abandoned'
   readonly result: 'red_win' | 'black_win' | 'draw' | 'abandoned'
   readonly termination: string
+}
+
+export interface StoredGame {
+  readonly id: string
+  readonly clientGameId: string
+  readonly playerId: string
+  readonly mode: 'ai' | 'local'
+  readonly difficulty: string
+  readonly aiDepth: number | null
+  readonly variationSeed: number | null
+  readonly adaptiveLevel: number | null
+  readonly state: 'active' | 'completed' | 'abandoned'
+  readonly result: 'red_win' | 'black_win' | 'draw' | 'abandoned' | null
+  readonly termination: string | null
+  readonly currentPlayer: 'red' | 'black'
+  readonly plyCount: number
+  readonly undoCount: number
+  readonly fallbackUsed: boolean
+  readonly settingsChanged: boolean
+  readonly revision: number
+  readonly resumeCount: number
+  readonly lastResumedAt: string | null
+  readonly startedAt: string
+  readonly updatedAt: string
+  readonly endedAt: string | null
 }
 
 interface QueuedOperation {
@@ -588,6 +619,29 @@ export class GameSyncClient {
     return payload as GameHistoryDetail
   }
 
+  async resumeGame(
+    deviceId: string,
+    playerId: string,
+    gameId: string,
+    expectedRevision: number,
+  ): Promise<StoredGame> {
+    const payload = await this.requestJson(
+      'POST',
+      `/v1/xiangqi/games/${encodeURIComponent(gameId)}/resume`,
+      { deviceId, playerId, expectedRevision },
+    )
+    if (
+      typeof payload !== 'object'
+      || payload === null
+      || (payload as StoredGame).state !== 'active'
+      || !Number.isInteger((payload as StoredGame).revision)
+      || typeof (payload as StoredGame).clientGameId !== 'string'
+    ) {
+      throw new Error('继续对局返回格式无效')
+    }
+    return payload as StoredGame
+  }
+
   flush(): Promise<void> {
     if (!this.isConfigured()) {
       return Promise.resolve()
@@ -598,6 +652,17 @@ export class GameSyncClient {
       })
     }
     return this.flushPromise
+  }
+
+  async flushAndRequireEmpty(): Promise<void> {
+    await this.flush()
+    if (this.outbox.length > 0) {
+      throw new Error('仍有对局数据等待同步，请检查网络后重试')
+    }
+  }
+
+  discardPendingStart(gameId: string): void {
+    this.pendingStarts.delete(gameId)
   }
 
   private enqueue(operation: QueuedOperation): void {

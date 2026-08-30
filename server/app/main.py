@@ -19,6 +19,8 @@ from .game_store import (
     MAX_ACTIVE_PROFILES,
     AdaptivePolicy,
     GameNotFound,
+    GameNotResumable,
+    GameRevisionConflict,
     GameStore,
     ProfileLimitReached,
     ProfileNotFound,
@@ -339,6 +341,7 @@ class GameSnapshotRequest(BaseModel):
     undoCount: int = Field(default=0, ge=0, le=300)
     fallbackUsed: bool = False
     settingsChanged: bool = False
+    revision: int = Field(default=0, ge=0)
 
     @field_validator("moves")
     @classmethod
@@ -363,6 +366,12 @@ class GameFinishRequest(GameSnapshotRequest):
         return self
 
 
+class GameResumeRequest(BaseModel):
+    deviceId: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    playerId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    expectedRevision: int = Field(ge=0)
+
+
 class StoredGame(BaseModel):
     id: str
     clientGameId: str
@@ -370,6 +379,7 @@ class StoredGame(BaseModel):
     mode: str
     difficulty: str
     aiDepth: int | None = None
+    variationSeed: int | None = None
     adaptiveLevel: int | None = None
     state: str
     result: str | None = None
@@ -379,6 +389,9 @@ class StoredGame(BaseModel):
     undoCount: int
     fallbackUsed: bool
     settingsChanged: bool
+    revision: int
+    resumeCount: int
+    lastResumedAt: str | None = None
     startedAt: str
     updatedAt: str
     endedAt: str | None = None
@@ -497,14 +510,19 @@ class GameHistorySummary(BaseModel):
     mode: str
     difficulty: str
     aiDepth: int | None = None
+    variationSeed: int | None = None
     adaptiveLevel: int | None = None
     state: str
     result: str | None = None
     termination: str | None = None
+    currentPlayer: str
     plyCount: int
     undoCount: int
     fallbackUsed: bool
     settingsChanged: bool
+    revision: int
+    resumeCount: int
+    lastResumedAt: str | None = None
     analysisState: str
     averageLossCp: float | None = None
     blunderCount: int
@@ -1250,7 +1268,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Xiangqi TV Engine API",
-    version="0.7.0",
+    version="0.8.0",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
@@ -1576,6 +1594,51 @@ async def get_game_history_detail(
     return GameHistoryDetail(**detail)
 
 
+@app.post("/v1/xiangqi/games/{game_id}/resume", response_model=StoredGame)
+async def resume_game(
+    game_id: str,
+    payload: GameResumeRequest,
+    _: Annotated[None, Depends(require_api_token)],
+) -> StoredGame:
+    del _
+    try:
+        await game_store.assert_game_owner(
+            payload.deviceId,
+            payload.playerId,
+            game_id,
+        )
+        detail = await game_store.get_game_detail(game_id, payload.playerId)
+        replay = validate_snapshot(
+            str(detail["initialFen"]),
+            [str(move["uci"]) for move in detail["moves"]],
+            str(detail["currentPlayer"]),
+        )
+        if replay.phase in {
+            "checkmate",
+            "stalemate",
+            "perpetual-check",
+            "prohibited-repetition",
+            "repetition-draw",
+        }:
+            raise IllegalPosition("对局已经形成终局，不能继续")
+        stored = await game_store.resume_game(
+            game_id,
+            expected_revision=payload.expectedRevision,
+        )
+    except GameNotFound as error:
+        raise HTTPException(status_code=404, detail="对局不存在") from error
+    except GameNotResumable as error:
+        raise HTTPException(status_code=409, detail="该对局不能继续") from error
+    except GameRevisionConflict as error:
+        raise HTTPException(
+            status_code=409,
+            detail="对局状态已更新，请刷新历史后重试",
+        ) from error
+    except IllegalPosition as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return StoredGame(**stored)
+
+
 @app.post("/v1/xiangqi/adaptive/lock", response_model=AdaptiveProfileResponse)
 async def set_adaptive_lock(
     payload: AdaptiveLockRequest,
@@ -1634,9 +1697,15 @@ async def update_game_snapshot(
             undo_count=payload.undoCount,
             fallback_used=payload.fallbackUsed,
             settings_changed=payload.settingsChanged,
+            revision=payload.revision,
         )
     except GameNotFound as error:
         raise HTTPException(status_code=404, detail="对局不存在") from error
+    except GameRevisionConflict as error:
+        raise HTTPException(
+            status_code=409,
+            detail="对局版本已过期，请刷新后重试",
+        ) from error
     except IllegalPosition as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     return StoredGame(**stored)
@@ -1681,9 +1750,15 @@ async def finish_game(
             undo_count=payload.undoCount,
             fallback_used=payload.fallbackUsed,
             settings_changed=payload.settingsChanged,
+            revision=payload.revision,
         )
     except GameNotFound as error:
         raise HTTPException(status_code=404, detail="对局不存在") from error
+    except GameRevisionConflict as error:
+        raise HTTPException(
+            status_code=409,
+            detail="对局版本已过期，请刷新后重试",
+        ) from error
     except IllegalPosition as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     if stored is None:

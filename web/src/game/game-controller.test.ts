@@ -169,6 +169,34 @@ describe('GameController local match controls', () => {
     expect(snapshot.lastMove).toBeNull()
     expect(snapshot.status.phase).toBe('playing')
   })
+
+  it('restores a saved move sequence without rendering intermediate states', () => {
+    const controller = new GameController(INITIAL_BOARD)
+    const restored = controller.restoreMoves([
+      {
+        pieceId: 'red-soldier-0',
+        from: { row: 6, col: 0 },
+        to: { row: 5, col: 0 },
+        capturedPiece: null,
+      },
+      {
+        pieceId: 'black-soldier-0',
+        from: { row: 3, col: 0 },
+        to: { row: 4, col: 0 },
+        capturedPiece: null,
+      },
+    ])
+
+    const snapshot = controller.getSnapshot()
+    expect(restored).toBe(true)
+    expect(snapshot.currentPlayer).toBe('red')
+    expect(snapshot.history).toHaveLength(2)
+    expect(snapshot.lastMove?.pieceId).toBe('black-soldier-0')
+    expect(snapshot.moveRecords.map((record) => record.notation)).toEqual([
+      '兵九进一',
+      '卒1进1',
+    ])
+  })
 })
 
 describe('GameController repetition rules', () => {
