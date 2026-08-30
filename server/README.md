@@ -95,6 +95,16 @@ outcomes for unilateral perpetual check and other prohibited attacking cycles.
 Ambiguous deep-exchange cases that require human referee judgment are treated
 as allowed moves instead of risking a false loss.
 
+API version 0.8.0 adds resumable unfinished games. History summaries expose a
+monotonic lifecycle `revision`, `resumeCount`, `lastResumedAt`, the saved side to
+move, and the original AI variation seed. `POST /v1/xiangqi/games/{game_id}/resume`
+revalidates ownership and the complete replay before reopening an active or
+abandoned nonterminal game. Snapshot and finish writes carry their observed
+revision and return HTTP 409 when stale, preventing delayed outbox operations or
+another client from overwriting a resumed lifecycle. Resume retries are
+idempotent, while completed, zero-ply, rated, or post-game-analysis records remain
+immutable.
+
 ## Runtime configuration
 
 The systemd unit reads `/etc/xiangqi-engine-api.env`:

@@ -13,6 +13,7 @@ from app.main import (
     AnalysisLine,
     AnalysisRequest,
     GameFinishRequest,
+    GameResumeRequest,
     GameSnapshotRequest,
     GameStartRequest,
     MAX_ANALYSIS_MULTIPV,
@@ -24,6 +25,7 @@ from app.main import (
     get_side_to_move,
     select_humanized_line,
     finish_game,
+    resume_game,
     update_game_snapshot,
 )
 
@@ -95,6 +97,54 @@ class DeviceOwnershipRequestTests(unittest.TestCase):
 
 
 class GameWriteValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resume_revalidates_the_stored_position(self) -> None:
+        store = AsyncMock()
+        store.assert_game_owner = AsyncMock()
+        store.get_game_detail.return_value = {
+            "initialFen": INITIAL_FEN,
+            "moves": [{"uci": "h2e2"}],
+            "currentPlayer": "black",
+        }
+        store.resume_game.return_value = {
+            "id": "game-1",
+            "clientGameId": "game_12345678",
+            "playerId": "profile_12345678",
+            "mode": "ai",
+            "difficulty": "adaptive",
+            "aiDepth": 3,
+            "variationSeed": 17,
+            "adaptiveLevel": 1,
+            "state": "active",
+            "result": None,
+            "termination": None,
+            "currentPlayer": "black",
+            "plyCount": 1,
+            "undoCount": 0,
+            "fallbackUsed": False,
+            "settingsChanged": False,
+            "revision": 1,
+            "resumeCount": 1,
+            "lastResumedAt": "2026-08-30 00:00:00",
+            "startedAt": "2026-08-29 00:00:00",
+            "updatedAt": "2026-08-30 00:00:00",
+            "endedAt": None,
+        }
+        payload = GameResumeRequest(
+            deviceId="device_12345678",
+            playerId="profile_12345678",
+            expectedRevision=0,
+        )
+
+        with patch("app.main.game_store", store):
+            result = await resume_game("game-1", payload, None)
+
+        self.assertEqual(result.revision, 1)
+        self.assertEqual(result.currentPlayer, "black")
+        store.resume_game.assert_awaited_once_with(
+            "game-1",
+            expected_revision=0,
+        )
+
     async def test_snapshot_rejects_an_illegal_move_before_storage(self) -> None:
         store = AsyncMock()
         store.assert_game_owner = AsyncMock()

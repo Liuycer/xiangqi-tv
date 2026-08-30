@@ -8,6 +8,7 @@ from pathlib import Path
 from app.game_store import (
     AdaptivePolicy,
     GameNotFound,
+    GameRevisionConflict,
     GameStore,
     ProfileLimitReached,
     ProfileNotFound,
@@ -286,6 +287,59 @@ class ProfileStoreTests(unittest.IsolatedAsyncioTestCase):
         history = await self.store.list_games(profile["profileId"], limit=20, offset=0)
         self.assertEqual(history["total"], 1)
         self.assertEqual(history["items"][0]["plyCount"], 1)
+
+    async def test_abandoned_game_resumes_with_a_new_revision(self) -> None:
+        profile = (await self.store.bootstrap_profiles("device_12345678", None))[0]
+        game = await self.store.create_game(
+            client_game_id="game_resume_12345678",
+            player_id=profile["profileId"],
+            mode="ai",
+            difficulty="adaptive",
+            ai_depth=3,
+            variation_seed=17,
+            adaptive_level=1,
+            initial_fen="initial",
+        )
+        await self.store.finish_game(
+            game["id"],
+            state="abandoned",
+            result="abandoned",
+            termination="app_closed",
+            moves=["h2e2"],
+            current_player="black",
+            undo_count=0,
+            fallback_used=False,
+            settings_changed=False,
+        )
+
+        resumed = await self.store.resume_game(game["id"], expected_revision=0)
+
+        self.assertEqual(resumed["state"], "active")
+        self.assertIsNone(resumed["result"])
+        self.assertIsNone(resumed["endedAt"])
+        self.assertEqual(resumed["revision"], 1)
+        self.assertEqual(resumed["resumeCount"], 1)
+        self.assertEqual(resumed["variationSeed"], 17)
+        with self.assertRaises(GameRevisionConflict):
+            await self.store.update_snapshot(
+                game["id"],
+                moves=["h2e2", "h9g7"],
+                current_player="red",
+                undo_count=0,
+                fallback_used=False,
+                settings_changed=False,
+                revision=0,
+            )
+        updated = await self.store.update_snapshot(
+            game["id"],
+            moves=["h2e2", "h9g7"],
+            current_player="red",
+            undo_count=0,
+            fallback_used=False,
+            settings_changed=False,
+            revision=1,
+        )
+        self.assertEqual(updated["plyCount"], 2)
 
 
 if __name__ == "__main__":

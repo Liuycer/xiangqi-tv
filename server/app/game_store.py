@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 
 GameState = Literal["active", "completed", "abandoned"]
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 MAX_ACTIVE_PROFILES = 6
 RECOVERY_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 
@@ -32,6 +32,14 @@ class AdaptivePolicy:
 
 
 class GameNotFound(RuntimeError):
+    pass
+
+
+class GameRevisionConflict(RuntimeError):
+    pass
+
+
+class GameNotResumable(RuntimeError):
     pass
 
 
@@ -301,6 +309,19 @@ class GameStore:
             self._ensure_column(connection, "games", "rating_before", "REAL")
             self._ensure_column(connection, "games", "rating_after", "REAL")
             self._ensure_column(connection, "games", "adaptive_level", "INTEGER")
+            self._ensure_column(
+                connection,
+                "games",
+                "revision",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                connection,
+                "games",
+                "resume_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(connection, "games", "last_resumed_at", "TEXT")
             profiles = (
                 (0, "A0", "初学", 2, 0, 0, 900),
                 (1, "A1", "入门", 3, 1, 1, 1050),
@@ -754,6 +775,7 @@ class GameStore:
                     UPDATE games
                     SET state = 'abandoned', result = 'abandoned',
                         termination = 'superseded_by_new_game',
+                        revision = revision + 1,
                         updated_at = CURRENT_TIMESTAMP, ended_at = CURRENT_TIMESTAMP
                     WHERE player_id = ? AND state = 'active'
                       AND client_game_id <> ?
@@ -796,6 +818,7 @@ class GameStore:
         undo_count: int,
         fallback_used: bool,
         settings_changed: bool,
+        revision: int = 0,
     ) -> dict[str, Any]:
         async with self.lock:
             return await asyncio.to_thread(
@@ -806,6 +829,7 @@ class GameStore:
                 undo_count,
                 fallback_used,
                 settings_changed,
+                revision,
             )
 
     def _update_snapshot_sync(
@@ -816,6 +840,7 @@ class GameStore:
         undo_count: int,
         fallback_used: bool,
         settings_changed: bool,
+        revision: int,
     ) -> dict[str, Any]:
         with self._connect() as connection:
             game = connection.execute(
@@ -824,6 +849,8 @@ class GameStore:
             ).fetchone()
             if game is None:
                 raise GameNotFound(game_id)
+            if int(game["revision"]) != revision:
+                raise GameRevisionConflict(game_id)
             if game["state"] == "active":
                 stored_id = str(game["id"])
                 connection.execute("DELETE FROM game_moves WHERE game_id = ?", (stored_id,))
@@ -865,7 +892,8 @@ class GameStore:
     def _get_game_validation_context_sync(self, game_id: str) -> dict[str, Any]:
         with self._connect() as connection:
             game = connection.execute(
-                "SELECT initial_fen, state FROM games WHERE id = ? OR client_game_id = ?",
+                "SELECT initial_fen, state, revision FROM games "
+                "WHERE id = ? OR client_game_id = ?",
                 (game_id, game_id),
             ).fetchone()
             if game is None:
@@ -873,6 +901,7 @@ class GameStore:
             return {
                 "initialFen": game["initial_fen"],
                 "state": game["state"],
+                "revision": int(game["revision"]),
             }
 
     async def claim_analysis_job(self) -> dict[str, Any] | None:
@@ -1587,14 +1616,19 @@ class GameStore:
             "mode": row["mode"],
             "difficulty": row["difficulty"],
             "aiDepth": row["ai_depth"],
+            "variationSeed": row["variation_seed"],
             "adaptiveLevel": row["adaptive_level"],
             "state": row["state"],
             "result": row["result"],
             "termination": row["termination"],
+            "currentPlayer": row["current_player"],
             "plyCount": int(row["ply_count"]),
             "undoCount": int(row["undo_count"]),
             "fallbackUsed": bool(row["fallback_used"]),
             "settingsChanged": bool(row["settings_changed"]),
+            "revision": int(row["revision"]),
+            "resumeCount": int(row["resume_count"]),
+            "lastResumedAt": row["last_resumed_at"],
             "analysisState": row["analysis_state"] or "not_queued",
             "averageLossCp": (
                 round(float(row["average_loss_cp"]), 1)
@@ -1605,6 +1639,94 @@ class GameStore:
             "startedAt": row["started_at"],
             "endedAt": row["ended_at"],
         }
+
+    async def resume_game(
+        self,
+        game_id: str,
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        async with self.lock:
+            return await asyncio.to_thread(
+                self._resume_game_sync,
+                game_id,
+                expected_revision,
+            )
+
+    def _resume_game_sync(
+        self,
+        game_id: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            game = connection.execute(
+                "SELECT * FROM games WHERE id = ? OR client_game_id = ?",
+                (game_id, game_id),
+            ).fetchone()
+            if game is None:
+                raise GameNotFound(game_id)
+
+            current_revision = int(game["revision"])
+            if (
+                game["state"] == "active"
+                and current_revision == expected_revision + 1
+                and int(game["resume_count"]) > 0
+            ):
+                return self._row_to_game(game)
+            if current_revision != expected_revision:
+                raise GameRevisionConflict(game_id)
+            if game["state"] == "completed" or int(game["ply_count"]) <= 0:
+                raise GameNotResumable(game_id)
+
+            protected = connection.execute(
+                """
+                SELECT 1 FROM rating_events WHERE game_id = ?
+                UNION ALL
+                SELECT 1 FROM analysis_jobs WHERE game_id = ?
+                LIMIT 1
+                """,
+                (game["id"], game["id"]),
+            ).fetchone()
+            if protected is not None:
+                raise GameNotResumable(game_id)
+
+            connection.execute(
+                """
+                DELETE FROM games
+                WHERE player_id = ? AND state = 'active' AND ply_count = 0
+                  AND id <> ?
+                """,
+                (game["player_id"], game["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE games
+                SET state = 'abandoned', result = 'abandoned',
+                    termination = 'superseded_by_resumed_game',
+                    revision = revision + 1,
+                    updated_at = CURRENT_TIMESTAMP, ended_at = CURRENT_TIMESTAMP
+                WHERE player_id = ? AND state = 'active' AND id <> ?
+                """,
+                (game["player_id"], game["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE games
+                SET state = 'active', result = NULL, termination = NULL,
+                    revision = revision + 1,
+                    resume_count = resume_count + 1,
+                    last_resumed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP, ended_at = NULL
+                WHERE id = ?
+                """,
+                (game["id"],),
+            )
+            resumed = connection.execute(
+                "SELECT * FROM games WHERE id = ?",
+                (game["id"],),
+            ).fetchone()
+            assert resumed is not None
+            return self._row_to_game(resumed)
 
     async def finish_game(
         self,
@@ -1618,6 +1740,7 @@ class GameStore:
         undo_count: int,
         fallback_used: bool,
         settings_changed: bool,
+        revision: int = 0,
     ) -> dict[str, Any] | None:
         async with self.lock:
             return await asyncio.to_thread(
@@ -1631,6 +1754,7 @@ class GameStore:
                 undo_count,
                 fallback_used,
                 settings_changed,
+                revision,
             )
 
     def _finish_game_sync(
@@ -1644,6 +1768,7 @@ class GameStore:
         undo_count: int,
         fallback_used: bool,
         settings_changed: bool,
+        revision: int,
     ) -> dict[str, Any] | None:
         with self._connect() as connection:
             game = connection.execute(
@@ -1652,6 +1777,8 @@ class GameStore:
             ).fetchone()
             if game is None:
                 raise GameNotFound(game_id)
+            if int(game["revision"]) != revision:
+                raise GameRevisionConflict(game_id)
             if game["state"] == "active":
                 stored_id = str(game["id"])
                 if state == "abandoned" and not moves:
@@ -1706,6 +1833,7 @@ class GameStore:
             "mode": row["mode"],
             "difficulty": row["difficulty"],
             "aiDepth": row["ai_depth"],
+            "variationSeed": row["variation_seed"],
             "adaptiveLevel": row["adaptive_level"],
             "state": row["state"],
             "result": row["result"],
@@ -1715,6 +1843,9 @@ class GameStore:
             "undoCount": row["undo_count"],
             "fallbackUsed": bool(row["fallback_used"]),
             "settingsChanged": bool(row["settings_changed"]),
+            "revision": int(row["revision"]),
+            "resumeCount": int(row["resume_count"]),
+            "lastResumedAt": row["last_resumed_at"],
             "startedAt": row["started_at"],
             "updatedAt": row["updated_at"],
             "endedAt": row["ended_at"],

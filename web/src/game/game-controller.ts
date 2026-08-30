@@ -169,6 +169,17 @@ export class GameController {
     this.status = getGameStatus(this.board, this.currentPlayer)
   }
 
+  restoreMoves(moves: ReadonlyArray<Move>): boolean {
+    this.restartGame()
+    for (const move of moves) {
+      if (!this.playMove(move)) {
+        this.restartGame()
+        return false
+      }
+    }
+    return true
+  }
+
   private executeMove(move: Move): void {
     const movingPiece = this.board.find((piece) => piece.id === move.pieceId)
     if (!movingPiece) {
