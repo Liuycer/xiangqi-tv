@@ -54,6 +54,7 @@
 
 ## 进度日志
 
+- 2026-08-30：提交 PR #11（Phase 38–40 续局与 Phase 41 烟花）后清理工作区：本地 main fast-forward 至 `d18431e`，README 进度行更新为 Phase 25–41，删除 6 个已合并本地分支（`agent/cloud-ai-vps-migration`、`codex/docs-phase-25-28-readme`、`codex/fix-history-client-stability`、`codex/phase-14-18-analysis`、`codex/phase-37-history-pagination`、`codex/phase-38-40-resumable-games`）；远端旧 feature 分支保留未动。
 - 2026-08-28：建立本备忘文件；子代理完成项目现状调查（即上文「当前状态」）。
 - 2026-08-28：5 路子代理并行 bug 审查完成（规则引擎/AI与历史同步/UI输入/服务端/协议+Android）。确认严重 2 个：① CORS allow_methods 缺 PATCH/DELETE（main.py:1210，档案改名/删除必失败）；② 同步 outbox 队头 4xx 永久死锁（game-sync-client.ts:490-527）。中等级别包括：档案归属校验可绕过（deviceId 省略即跳过）、三次重复裁定要求等间距周期、备份服务 ReadOnlyPaths 必然失败、分析 worker claim 异常永久死亡、遥控 OK 绕过禁用态。Android 壳与本地规则引擎核心未见问题；「humanize/depth 矛盾」经人工复核为误报已剔除。
 - 2026-08-28：Phase 29 完成并部署。修复 SQLite WAL 在线备份：源库使用 `mode=ro + query_only`，压缩包发布前执行恢复与 `quick_check`，systemd 放行 WAL `-shm` 辅助文件；FastAPI 补齐 PATCH/DELETE/OPTIONS，Nginx 使用 `xiangqi_api_v2` 让 OPTIONS 绕过限流并为 429 返回带 CORS 的 JSON。生产备份 `xiangqi-20260828T061554Z.db.gz` 校验通过，在线库与备份均为 48 局；API/Pikafish 正常，服务端 28 项测试通过。
